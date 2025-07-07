@@ -8,8 +8,10 @@ import os
 import contextlib
 from nexusformat.nexus import nxload
 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
 @st.cache_data(show_spinner=False)
-def get_ollama_models(host="http://localhost:11434"):
+def get_ollama_models(host=OLLAMA_BASE_URL):
     try:
         res = requests.get(f"{host}/api/tags")
         if res.status_code == 200:
@@ -18,7 +20,7 @@ def get_ollama_models(host="http://localhost:11434"):
         pass
     return []
 
-def query_ollama(prompt, model, host="http://localhost:11434"):
+def query_ollama(prompt, model, host=OLLAMA_BASE_URL):
     try:
         res = requests.post(
             f"{host}/api/generate",
