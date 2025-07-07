@@ -16,6 +16,9 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+
+ENV OLLAMA_BASE_URL=http://localhost:11434
+
 # Copy the rest of the code
 COPY . .
 
