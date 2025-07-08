@@ -5,7 +5,7 @@ from PIL import Image, ImageOps
 import requests
 import tempfile
 import os
-import contextlib
+import base64
 from nexusformat.nexus import nxload
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -51,10 +51,9 @@ def summarize_image_array(arr):
         "mean": float(np.mean(arr))
     }
 
-def convert_16bit_to_preview(image, arr_16bit):
+def convert_16bit_to_preview(arr_16bit):
     arr = (arr_16bit - np.min(arr_16bit)) / (np.ptp(arr_16bit) + 1e-8) * 255
-    arr_8bit = arr.astype(np.uint8)
-    return Image.fromarray(arr_8bit, mode="L")
+    return arr.astype(np.uint8)
 
 st.set_page_config(page_title="FAIR NeXus Metadata Assistant", layout="centered")
 st.title("🔬 FAIR NeXus File Metadata Assistant")
@@ -67,7 +66,8 @@ if not models:
 
 selected_model = st.selectbox("Choose model", models)
 
-image_file = st.file_uploader("Upload microscope image (.tif, .png, .jpg)", type=["tif", "tiff", "png", "jpg"])
+# Accept multiple images
+image_files = st.file_uploader("Upload microscope image(s)", type=["tif", "tiff", "png", "jpg"], accept_multiple_files=True)
 
 st.subheader("📄 Metadata")
 metadata = {
@@ -79,76 +79,82 @@ metadata = {
 }
 
 if st.button("🧠 Send to LLM (Ollama on ORFEO)"):
-    if not image_file:
-        st.error("Please upload an image.")
-    else:
-        try:
-            original_img = Image.open(image_file)
-            image_array = np.array(original_img)
-            image_stats = summarize_image_array(image_array)
+    if not image_files:
+        st.error("Please upload at least one image.")
+        st.stop()
 
-            try:
-                if original_img.mode == "I;16":
-                    preview_img = convert_16bit_to_preview(original_img, image_array)
-                else:
-                    preview_img = ImageOps.autocontrast(original_img.convert("L"))
-                st.image(preview_img, caption="Microscope Image Preview", use_container_width=True)
-            except Exception as e:
-                st.warning(f"⚠️ Image preview failed: {e}")
+    try:
+        arrays = []
+        for f in image_files:
+            img = Image.open(f).convert("L")
+            arrays.append(np.array(img))
+        stack = np.stack(arrays, axis=0)
+        image_stats = summarize_image_array(stack)
+        stack_shape = stack.shape
 
-            prompt = f"""
-You are an AI agent that helps generate FAIR-compliant NeXus files.
+        preview = convert_16bit_to_preview(stack[0]) if stack.dtype == np.uint16 else stack[0]
+        st.image(preview, caption="Preview of First Image", use_container_width=True)
 
-A microscopy dataset has been uploaded. Based on the metadata and data summary below, determine the most appropriate NeXus application definition from the FAIRmat NeXus repositories:
+        prompt = f"""
+You are an AI agent that creates FAIR-compliant NeXus (.nxs) files.
 
+Dataset summary:
+- Number of images: {len(image_files)}
+- Stack shape: {stack_shape}
+- Metadata (JSON):
+{json.dumps(metadata, indent=2)}
+
+Use these NeXus definitions to find the most appropriate structure:
 - https://github.com/FAIRmat-NFDI/nexus_definitions/tree/fairmat/applications
 - https://github.com/FAIRmat-NFDI/nexus_definitions/tree/fairmat/contributed_definitions
 
 Your task:
-1. Identify and state the most suitable NeXus application definition for this data
-2. Justify your choice (1–2 sentences)
-3. Generate valid Python code using the `nexusformat` library to create the NeXus structure according to the selected definition
-4. Save the file to the predefined variable `output_path`
+1. Choose one NeXus application definition appropriate for this microscopy dataset.
+2. List the required fields.
+3. If any required fields are missing, return only:
+{{"missing": ["field1", "field2"]}}
+4. If everything is provided, return:
+{{"nexus_b64": "<base64-encoded-NX-file>"}}
 
-User-provided metadata (JSON):
-{json.dumps(metadata, indent=2)}
-
-Image data summary (JSON):
-{json.dumps(image_stats, indent=2)}
-
-Important:
-- Use correct NeXus group names and hierarchy
-- Include key metadata fields (sample ID, operator, instrument)
-- Use `NXdata` for image array (shape may be dummy)
-- Save using `nxroot.save(output_path)`
+The NeXus file should:
+- Follow NeXus hierarchy strictly
+- Use NXdata to store the image stack (compressed)
+- Save it using gzip and return as base64-encoded binary
 """
 
-            with st.spinner(f"Querying `{selected_model}` via Ollama..."):
-                response = query_ollama(prompt, model=selected_model)
-                st.success("✅ Response from LLM:")
-                st.code(response, language="python")
+        with st.spinner(f"Querying `{selected_model}` via Ollama..."):
+            raw_response = query_ollama(prompt, model=selected_model)
 
-                if st.checkbox("⚠️ Run the code above to generate a NeXus (.nxs) file?"):
-                    try:
-                        tmp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".nxs")
-                        tmp_output.close()
-                        output_path = tmp_output.name
-                        local_vars = {"output_path": output_path}
+        try:
+            response_json = json.loads(raw_response)
+        except Exception:
+            st.error("❌ LLM response is not valid JSON.")
+            st.code(raw_response)
+            st.stop()
 
-                        with contextlib.redirect_stdout(None):
-                            exec(response, {}, local_vars)
+        if "missing" in response_json:
+            st.warning("⚠️ Missing metadata fields required by NeXus:")
+            for field in response_json["missing"]:
+                metadata[field] = st.text_input(f"{field} (required):", "")
+            if st.button("🔁 Retry with completed metadata"):
+                st.rerun()
 
-                        with open(output_path, "rb") as f:
-                            st.download_button("⬇️ Download NeXus File", f, file_name="output.nxs")
+        elif "nexus_b64" in response_json:
+            decoded = base64.b64decode(response_json["nexus_b64"])
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".nxs") as tmp:
+                tmp.write(decoded)
+                tmp.flush()
+                with open(tmp.name, "rb") as f:
+                    st.download_button("⬇️ Download NeXus File", f, file_name="output.nxs")
+                try:
+                    nx = nxload(tmp.name)
+                    st.subheader("📁 NeXus File Tree")
+                    st.text(nx.tree)
+                except Exception as e:
+                    st.warning(f"Could not parse NeXus file: {e}")
+        else:
+            st.warning("❓ Unexpected response format.")
+            st.code(raw_response)
 
-                        try:
-                            nxfile = nxload(output_path)
-                            st.subheader("📁 NeXus File Tree")
-                            st.text(nxfile.tree)
-                        except Exception as e:
-                            st.warning(f"Could not preview NeXus file: {e}")
-
-                    except Exception as e:
-                        st.error(f"❌ Code execution failed: {e}")
-        except Exception as e:
-            st.error(f"❌ Failed to process image: {e}")
+    except Exception as e:
+        st.error(f"❌ Failed to process image or LLM request: {e}")
