@@ -7,7 +7,9 @@ import tempfile
 import os
 import base64
 from nexusformat.nexus import nxload
+from dotenv import load_dotenv
 
+load_dotenv()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 @st.cache_data(show_spinner=False)
