@@ -24,6 +24,16 @@
 
 ---
 
+### 🌐 Environment Configuration
+
+This app connects to an **Ollama API server** (e.g., for LLMs like `llama3`, `deepseek-coder`).
+
+To configure the connection, create a `.env` file in the project root:
+
+```bash
+# .env
+OLLAMA_BASE_URL=http://localhost:11434
+
 ## 🚀 Usage
 
 ### 1. Clone the repo
