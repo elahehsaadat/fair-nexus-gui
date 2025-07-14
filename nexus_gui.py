@@ -1,5 +1,3 @@
-# nexus_gui.py
-
 import streamlit as st
 import json
 import numpy as np
@@ -22,6 +20,7 @@ LOGO_NFFA = "https://raw.githubusercontent.com/elahehsaadat/fair-nexus-gui/main/
 LOGO_LADE = "https://raw.githubusercontent.com/elahehsaadat/fair-nexus-gui/main/assets/area.png"
 
 st.set_page_config(page_title="FAIR NeXus File Metadata Assistant", layout="centered")
+
 with st.sidebar:
     st.image(LOGO_NFFA, caption="NFFA-DI")
     st.image(LOGO_LADE, caption="AREA Science Park")
@@ -78,16 +77,14 @@ def read_image_any_format(file) -> np.ndarray:
 def convert_to_preview(arr):
     arr = np.asarray(arr)
 
-    # Remove alpha or singleton channel
     if arr.ndim == 3 and arr.shape[-1] == 4:
         arr = arr[..., :3]
     if arr.ndim == 3 and arr.shape[-1] == 1:
         arr = arr[..., 0]
 
-    if arr.ndim == 3 and arr.shape[-1] == 3:  # RGB
+    if arr.ndim == 3 and arr.shape[-1] == 3:
         return arr.astype(np.uint8)
-
-    if arr.ndim == 2:  # Grayscale
+    if arr.ndim == 2:
         arr = arr.astype(np.float32)
         if np.ptp(arr) == 0:
             return np.zeros_like(arr, dtype=np.uint8)
@@ -97,54 +94,58 @@ def convert_to_preview(arr):
 
 
 def safe_b64decode(b64_string):
-    b64_string = b64_string.strip().replace("\n", "")
+    b64_string = re.sub(r'[^A-Za-z0-9+/=]', '', b64_string)
     padded = b64_string + "=" * (-len(b64_string) % 4)
-    return base64.b64decode(padded)
+    try:
+        return base64.b64decode(padded)
+    except Exception as e:
+        raise ValueError(f"Base64 decoding failed: {e}")
 
 
+# === Main UI logic ===
 models = get_ollama_models()
 if not models:
-    st.error("⚠️ No models found. Start one on ORFEO using `ollama run <model>`.") 
+    st.error("⚠️ No models found. Start one on ORFEO using `ollama run <model>`. ")
     st.stop()
 
 selected_model = st.selectbox("LLM model served by Ollama", models)
 workflow = st.radio("Choose a workflow", ["Upload one image", "Reference a stack (folder / S3 URL)"], key="workflow")
 
-st.subheader("🧾 Basic metadata")
+st.subheader("📄 Basic metadata")
 if "meta" not in st.session_state:
-    st.session_state.meta = {}
+    st.session_state.meta = {
+        "instrument": "confocal microscope",
+        "sample_id": "",
+        "operator": "",
+    }
 
-fields = {
-    "instrument": "confocal microscope",
-    "sample_id": "",
-    "timestamp": "",
-    "operator": "",
-    "units": "a.u."
-}
-
-for key, default in fields.items():
-    st.session_state.meta[key] = st.text_input(key.replace("_", " ").title(), st.session_state.meta.get(key, default))
+for key in st.session_state.meta:
+    st.session_state.meta[key] = st.text_input(key.replace("_", " ").title(), st.session_state.meta[key], key=key)
 
 meta = st.session_state.meta
 
+# === Single image workflow ===
 if workflow == "Upload one image":
-    file = st.file_uploader("Upload microscopy image", type=["tif", "tiff", "png", "jpg", "jpeg"])
+    file = st.file_uploader("Upload microscopy image", type=["tif", "tiff", "png", "jpg", "jpeg"], key="file_uploader")
+
+    if file and "image_array" not in st.session_state:
+        st.session_state.image_array = read_image_any_format(file)
+        st.session_state.preview = convert_to_preview(st.session_state.image_array)
+
+    if "preview" in st.session_state:
+        st.image(st.session_state.preview, caption="Preview", use_container_width=True)
 
     if st.button("🔍 Analyse image in LLM"):
-        if not file:
-            st.error("Please upload an image.")
+        if "image_array" not in st.session_state:
+            st.error("⚠️ Please upload an image before analysing.")
             st.stop()
-        try:
-            image_array = read_image_any_format(file)
-            preview = convert_to_preview(image_array)
-            st.image(preview, caption="Preview", use_container_width=True)
 
-            prompt = f"""
+        prompt = f"""
 You are an expert AI that builds FAIR-compliant NeXus (.nxs) files for microscopy data.
 
 Here is the experimental context:
 - Number of images: 1
-- Image shape: {image_array.shape}
+- Image shape: {st.session_state.image_array.shape}
 - Metadata:
 {json.dumps(meta, indent=2)}
 
@@ -159,21 +160,21 @@ Respond in **valid JSON only** with one of the following:
 {{"nexus_b64": "<base64-encoded-nexus-file>"}}
 NO explanation. NO markdown.
 """
-            with st.spinner("Querying LLM via Ollama..."):
-                raw = query_ollama(prompt, model=selected_model)
-                cleaned = extract_json_from_text(raw)
+        with st.spinner("Querying LLM via Ollama..."):
+            raw = query_ollama(prompt, model=selected_model)
+            cleaned = extract_json_from_text(raw)
 
+        try:
             response_json = json.loads(cleaned)
+        except json.JSONDecodeError:
+            st.error("LLM did not return valid JSON:")
+            st.code(raw)
+            st.stop()
 
-            if "missing" in response_json:
-                st.warning("🚧 Missing required metadata:")
-                for f in response_json["missing"]:
-                    default = st.session_state.meta.get(f, "")
-                    st.session_state.meta[f] = st.text_input(f"➕ Provide **{f}**", default)
-                if st.button("🔁 Retry with completed metadata"):
-                    st.rerun()
-
-            elif "nexus_b64" in response_json:
+        if "missing" in response_json:
+            st.session_state.missing_fields = response_json["missing"]
+        elif "nexus_b64" in response_json:
+            try:
                 decoded = safe_b64decode(response_json["nexus_b64"])
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".nxs") as tmp:
                     tmp.write(decoded)
@@ -184,22 +185,21 @@ NO explanation. NO markdown.
                         st.text(nx.tree)
                     except Exception as e:
                         st.warning(f"Could not parse NeXus file: {e}")
-            else:
-                st.warning("Unexpected LLM response:")
-                st.code(cleaned)
+            except Exception as e:
+                st.error(f"❌ Failed to decode or validate NeXus file: {e}")
+        else:
+            st.warning("Unexpected LLM response:")
+            st.code(cleaned)
 
-        except Exception as e:
-            st.error(f"❌ Error while processing: {e}")
-
+# === Stack workflow ===
 elif workflow == "Reference a stack (folder / S3 URL)":
-    path = st.text_input("📂 Folder or S3 path")
+    path = st.text_input("📂 Folder or S3 path", key="stack_path")
     if st.button("🚀 Analyse stack in LLM") and path:
-        first_frame = None
         try:
             first_file = subprocess.check_output(["ls", "-1", path], text=True).splitlines()[0]
             img = read_image_any_format(Path(path) / first_file)
             first_frame = convert_to_preview(img)
-            st.image(first_frame, caption="First Frame", width=300)
+            st.image(first_frame, caption="First Frame", use_container_width=True)
         except Exception as e:
             st.warning(f"Preview failed: {e}")
 
@@ -224,12 +224,7 @@ Answer only the JSON object described.
         try:
             out = json.loads(cleaned)
             if "missing" in out:
-                st.warning("LLM says these fields are missing:")
-                for f in out["missing"]:
-                    default = st.session_state.meta.get(f, "")
-                    st.session_state.meta[f] = st.text_input(f"➕ Provide **{f}**", default)
-                if st.button("🔁 Retry with completed metadata"):
-                    st.rerun()
+                st.session_state.missing_fields = out["missing"]
             elif "nexus_b64" in out:
                 tmp = Path(tempfile.mkstemp(suffix=".nxs")[1])
                 tmp.write_bytes(safe_b64decode(out["nexus_b64"]))
@@ -240,3 +235,23 @@ Answer only the JSON object described.
                 st.code(out)
         except Exception as e:
             st.error(f"❌ LLM did not return JSON. Full text:\n{raw}")
+
+# === Missing fields handler ===
+if "missing_fields" in st.session_state and st.session_state.missing_fields:
+    st.warning("🚧 Missing required metadata:")
+    ready = True
+    for f in st.session_state.missing_fields:
+        input_key = f"missing_{f}"
+        value = st.text_input(f"➕ Provide **{f}**", value=st.session_state.meta.get(f, ""), key=input_key)
+        st.session_state.meta[f] = value
+        if value.strip() == "":
+            ready = False
+    if ready:
+        st.success("✅ After filling the missing fields, please press 'Analyse image in LLM' again to continue.")
+
+# === Global reset button (always last and always visible) ===
+st.markdown("---")
+if st.button("🔄 Reset"):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
