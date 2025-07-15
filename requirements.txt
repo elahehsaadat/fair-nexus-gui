@@ -20,7 +20,7 @@ jsonschema-specifications==2025.4.1
 MarkupSafe==3.0.2
 narwhals==1.44.0
 nexusformat==1.0.8
-numpy==2.3.0
+numpy==2.2.6
 packaging==25.0
 pandas==2.3.0
 paramiko==3.5.1
@@ -41,7 +41,7 @@ six==1.17.0
 smmap==5.0.2
 streamlit==1.46.0
 tenacity==9.1.2
-tifffile==2025.6.11
+tifffile==2024.6.18
 toml==0.10.2
 tornado==6.5.1
 typing_extensions==4.14.0
