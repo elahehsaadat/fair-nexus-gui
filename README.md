@@ -41,9 +41,11 @@ OLLAMA_BASE_URL=http://localhost:11434
 ```bash
 git clone https://github.com/elahehsaadat/fair-nexus-gui
 cd fair-nexus-gui
-python -m venv .venv && source .venv/bin/activate    # or Windows: .venv\Scripts\activate
+py -3.10 -m venv .venv && source .venv/bin/activate    # or Windows: .venv\Scripts\activate
+
 pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
+
 access to ollama on orfeo "ssh -L 11434:10.128.2.165:11434 orfeo"
 echo "OLLAMA_BASE_URL=http://localhost:11434" > .env # adjust for remote
 streamlit run nexus_gui.py
