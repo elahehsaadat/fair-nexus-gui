@@ -20,7 +20,7 @@ flexparser==0.4
 fonttools==4.58.5
 gitdb==4.0.12
 GitPython==3.1.44
-h5py==3.14.0
+h5py==3.10.0
 hdf5plugin==5.1.0
 idna==3.10
 importlib_metadata==8.7.0
@@ -30,7 +30,7 @@ jsonschema-specifications==2025.4.1
 kiwisolver==1.4.8
 lxml==6.0.0
 MarkupSafe==3.0.2
-matplotlib==3.10.3
+matplotlib==3.8.4
 mergedeep==1.3.4
 narwhals==1.44.0
 nexusformat==1.0.8
@@ -39,7 +39,7 @@ nxvalidate==0.3.5b3
 packaging==25.0
 pandas==2.3.0
 paramiko==3.5.1
-pillow==11.2.1
+Pillow==11.2.1
 Pint==0.24.4
 platformdirs==4.3.8
 protobuf==6.31.1
@@ -56,7 +56,7 @@ PyYAML==6.0.2
 referencing==0.36.2
 requests==2.32.4
 rpds-py==0.25.1
-scipy==1.15.3
+scipy==1.11.4
 six==1.17.0
 smmap==5.0.2
 streamlit==1.46.0
