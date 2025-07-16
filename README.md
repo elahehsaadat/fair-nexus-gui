@@ -18,9 +18,9 @@
 
 ## ⚙️ Requirements
 
-- Python ≥ 3.9
-- Dependencies: see [`requirements.txt`](./requirements.txt)
-- Ollama must be running locally or accessible remotely (with model pulled)
+- **Python 3.10**
+- [`ollama`](https://ollama.com/) installed and running (locally or via SSH tunnel)
+- All dependencies listed in [`requirements.txt`](./requirements.txt)
 
 ---
 
@@ -39,13 +39,22 @@ OLLAMA_BASE_URL=http://localhost:11434
 ## Quick start (local)
 
 ```bash
+
+# Clone
 git clone https://github.com/elahehsaadat/fair-nexus-gui
 cd fair-nexus-gui
+
+# Create virtual environment (Python 3.10)
 py -3.10 -m venv .venv && source .venv/bin/activate    # or Windows: .venv\Scripts\activate
 
+# Install dependencies
 pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
+pip install -r requirements.txt (pip install --only-binary=:all: -r requirements.txt)
 
+
+# Tunnel to ORFEO (if using remote LLM)
 access to ollama on orfeo "ssh -L 11434:10.128.2.165:11434 orfeo"
 echo "OLLAMA_BASE_URL=http://localhost:11434" > .env # adjust for remote
+
+# Run the app
 streamlit run nexus_gui.py
