@@ -3,6 +3,11 @@
 import numpy as np
 import h5py
 from pathlib import Path
+import subprocess
+import os
+
+
+FAIRMAT_DEFINITIONS = Path(__file__).parent / "nexus_definitions"
 
 def generate_nexus_file(image_array: np.ndarray, fields: dict, definition: str, output_path: Path):
     """
@@ -47,3 +52,38 @@ def generate_nexus_file(image_array: np.ndarray, fields: dict, definition: str, 
         units = fields.get("units", "counts")
         detector["data"].attrs["units"] = str(units)
 
+
+def validate_nexus_file(file_path: Path) -> str:
+    """
+    Validate a NeXus file using nxinspect in a pseudo-terminal to avoid TTY errors.
+    This method works reliably inside Streamlit and is portable across systems with `script`.
+    """
+
+    if not file_path.exists():
+        return f"❌ File does not exist: {file_path}"
+
+    if not FAIRMAT_DEFINITIONS.exists():
+        return f"❌ FAIRmat definitions folder not found at: {FAIRMAT_DEFINITIONS}"
+
+    # Use `script` to create a pseudo-TTY environment for nxinspect
+    try:
+        result = subprocess.run(
+            [
+                "script", "-q", "-c", 
+                f"nxinspect -f {file_path} -a -d {FAIRMAT_DEFINITIONS} -e",
+                "/dev/null"
+            ],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+        if result.returncode == 0 and "Traceback" not in result.stdout:
+            return "✅ Validation successful: conforms to the selected NeXus application definition."
+        else:
+            return f"❌ Validation failed:\n{result.stdout or result.stderr}"
+
+    except FileNotFoundError:
+        return "❌ Required command `script` or `nxinspect` not found. Please install `nxvalidate` and ensure it's in your PATH."
+    except Exception as e:
+        return f"❌ Unexpected error during validation: {e}"

@@ -16,6 +16,8 @@ import subprocess
 from nexusformat.nexus import nxload
 
 from nexus_generator import generate_nexus_file  # Your local generator
+from nexus_generator import validate_nexus_file
+
 
 load_dotenv()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -185,6 +187,9 @@ Return only one of the following formats:
 
                 st.success("✅ NeXus file created!")
                 st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="output.nxs")
+                validation_msg = validate_nexus_file(nexus_path)
+                st.markdown("### ✅ NeXus File Validation")
+                st.code(validation_msg)
 
                 try:
                     nx = nxload(str(nexus_path))
@@ -272,6 +277,9 @@ Rules:
                 )
                 st.success("✅ NeXus file created!")
                 st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="stack.nxs")
+                validation_msg = validate_nexus_file(nexus_path)
+                st.markdown("### ✅ NeXus File Validation")
+                st.code(validation_msg)
             else:
                 st.error("Unexpected LLM response:")
                 st.code(cleaned)
@@ -287,8 +295,8 @@ if "missing_fields" in st.session_state and st.session_state.missing_fields:
         st.session_state.meta[f] = value
         if not value.strip():
             ready = False
-    if ready:
-        st.success("✅ Re-run the analysis to continue with the new metadata.")
+    
+    st.success("✅ Re-run the analysis to continue with the new metadata.")
 
 # === Reset Button ===
 st.markdown("---")
