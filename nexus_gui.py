@@ -18,6 +18,7 @@ from nexusformat.nexus import nxload
 from nexus_generator import generate_nexus_file  # Your local generator
 from nexus_generator import validate_nexus_file
 
+from mapping_store import get_mapping, save_mapping
 
 load_dotenv()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -127,6 +128,29 @@ if workflow == "Upload one image":
             st.error("Please upload an image first.")
             st.stop()
 
+        instrument = meta.get("instrument", "").lower().strip()
+        existing = get_mapping(instrument)
+
+        if existing:
+            st.info("📁 Using saved mapping from database.")
+            try:
+                nexus_path = Path(tempfile.mkstemp(suffix=".nxs")[1])
+                generate_nexus_file(
+                    image_array=image_array,  # or stack if in stack workflow
+                    fields=existing["fields"],
+                    definition=existing["definition"],
+                    output_path=nexus_path
+                )
+                st.success("✅ NeXus file created from saved mapping.")
+                st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="output.nxs")
+                validation_msg = validate_nexus_file(nexus_path)
+                st.markdown("### ✅ NeXus File Validation")
+                st.code(validation_msg)
+            except Exception as e:
+                st.error(f"Failed to generate NeXus file: {e}")
+            st.stop()
+
+        # Fallback to LLM if no mapping exists
         prompt = f"""
 You are an expert on NeXus data standards and microscopy metadata.
 
@@ -216,6 +240,29 @@ elif workflow == "Reference a stack (folder / S3 URL)":
             st.error(f"Failed to load image stack: {e}")
             st.stop()
 
+        instrument = meta.get("instrument", "").lower().strip()
+        existing = get_mapping(instrument)
+
+        if existing:
+            st.info("📁 Using saved mapping from database.")
+            try:
+                nexus_path = Path(tempfile.mkstemp(suffix=".nxs")[1])
+                generate_nexus_file(
+                    image_array=image_array,  # or stack if in stack workflow
+                    fields=existing["fields"],
+                    definition=existing["definition"],
+                    output_path=nexus_path
+                )
+                st.success("✅ NeXus file created from saved mapping.")
+                st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="output.nxs")
+                validation_msg = validate_nexus_file(nexus_path)
+                st.markdown("### ✅ NeXus File Validation")
+                st.code(validation_msg)
+            except Exception as e:
+                st.error(f"Failed to generate NeXus file: {e}")
+            st.stop()
+
+        # Fallback to LLM if no mapping exists
         prompt = f"""
 You are an expert in NeXus data formats and FAIRmat ontologies.
 
