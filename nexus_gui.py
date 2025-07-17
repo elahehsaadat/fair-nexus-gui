@@ -153,6 +153,9 @@ Return only one of the following formats:
         if "missing" in response_json:
             st.session_state.missing_fields = response_json["missing"]
         elif "definition" in response_json and "fields" in response_json:
+            # Save the new mapping
+            save_mapping(instrument, {"definition": response_json["definition"],"fields": response_json["fields"]})
+
             try:
                 nexus_path = Path(tempfile.mkstemp(suffix=".nxs")[1])
                 generate_nexus_file(
@@ -268,6 +271,9 @@ Rules:
             if "missing" in response_json:
                 st.session_state.missing_fields = response_json["missing"]
             elif "definition" in response_json and "fields" in response_json:
+                # Save the new mapping
+                save_mapping(instrument, {"definition": response_json["definition"],"fields": response_json["fields"]})
+
                 nexus_path = Path(tempfile.mkstemp(suffix=".nxs")[1])
                 generate_nexus_file(
                     image_array=stack,
