@@ -15,6 +15,14 @@ import re
 import subprocess
 from nexusformat.nexus import nxload
 
+from upload_utils import (
+    extract_json_from_text,
+    get_ollama_models,
+    query_ollama,
+    read_image_any_format,
+    convert_to_preview,
+)
+
 from nexus_generator import generate_nexus_file  # Your local generator
 from nexus_generator import validate_nexus_file
 
@@ -32,63 +40,8 @@ with st.sidebar:
     st.image(LOGO_NFFA, caption="NFFA-DI")
     st.image(LOGO_LADE, caption="AREA Science Park")
 
-st.title("🔬 FAIR NeXus File Metadata Assistant")
+st.title("🔬 FAIR NeXus Assistant")
 
-# === Utility Functions ===
-def extract_json_from_text(text):
-    match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
-    return match.group(1) if match else text
-
-@st.cache_data(show_spinner=False)
-def get_ollama_models(host=OLLAMA_BASE_URL):
-    try:
-        res = requests.get(f"{host}/api/tags")
-        if res.status_code == 200:
-            return [m["name"] for m in res.json().get("models", [])]
-    except Exception:
-        pass
-    return []
-
-def query_ollama(prompt, model, host=OLLAMA_BASE_URL):
-    try:
-        res = requests.post(
-            f"{host}/api/generate",
-            json={"model": model, "prompt": prompt},
-            stream=True
-        )
-        if res.status_code != 200:
-            return f'{{"error": "Status {res.status_code}: {res.text}"}}'
-
-        output = ""
-        for line in res.iter_lines():
-            if line:
-                try:
-                    chunk = json.loads(line)
-                    output += chunk.get("response", "")
-                except Exception:
-                    pass
-        return output.strip()
-    except Exception as e:
-        return f'{{"error": "Ollama request failed: {str(e)}"}}'
-
-def read_image_any_format(file) -> np.ndarray:
-    try:
-        return tifffile.imread(file)
-    except Exception:
-        return np.array(Image.open(file))
-
-def convert_to_preview(arr):
-    arr = np.asarray(arr)
-    if arr.ndim == 3 and arr.shape[-1] == 4:
-        arr = arr[..., :3]
-    if arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = arr[..., 0]
-    if arr.ndim == 3 and arr.shape[-1] == 3:
-        return arr.astype(np.uint8)
-    if arr.ndim == 2:
-        arr = arr.astype(np.float32)
-        return ((arr - np.min(arr)) / np.ptp(arr) * 255).astype(np.uint8)
-    raise ValueError(f"Unsupported image shape: {arr.shape}")
 
 # === UI Logic ===
 
