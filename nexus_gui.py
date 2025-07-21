@@ -3,16 +3,10 @@
 import streamlit as st
 import json
 import numpy as np
-from PIL import Image
-import tifffile
-import requests
+from pathlib import Path
 import tempfile
 import os
-import base64
-from pathlib import Path
 from dotenv import load_dotenv
-import re
-import subprocess
 from nexusformat.nexus import nxload
 
 from upload_utils import (
@@ -21,11 +15,12 @@ from upload_utils import (
     query_ollama,
     read_image_any_format,
     convert_to_preview,
+    extract_metadata_from_tiff,
+    extract_metadata_from_json_header,
+    build_standard_metadata,
 )
 
-from nexus_generator import generate_nexus_file  # Your local generator
-from nexus_generator import validate_nexus_file
-
+from nexus_generator import generate_nexus_file, validate_nexus_file
 from mapping_store import get_mapping, save_mapping
 
 load_dotenv()
@@ -42,16 +37,13 @@ with st.sidebar:
 
 st.title("🔬 FAIR NeXus Assistant")
 
-
-# === UI Logic ===
-
 models = get_ollama_models()
 if not models:
     st.error("⚠️ No models found. Start one on ORFEO using `ollama run <model>`. ")
     st.stop()
 
 selected_model = st.selectbox("LLM model served by Ollama", models)
-workflow = st.radio("Choose a workflow", ["Upload one image", "Reference a stack (folder / S3 URL)"], key="workflow")
+workflow = st.radio("Choose a workflow", ["Upload image + metadata", "Reference a stack (folder / S3 URL)"])
 
 st.subheader("📄 Basic metadata")
 if "meta" not in st.session_state:
@@ -67,110 +59,141 @@ for key in st.session_state.meta:
 meta = st.session_state.meta
 
 # === SINGLE IMAGE WORKFLOW ===
-if workflow == "Upload one image":
+if workflow == "Upload image + metadata":
     file = st.file_uploader("Upload microscopy image", type=["tif", "tiff", "png", "jpg", "jpeg"], key="file_uploader")
+    header = st.file_uploader("(Optional) Upload separate metadata (JSON)", type="json", key="json_uploader")
+
     if file:
         image = read_image_any_format(file)
         st.session_state.image_array = image
         st.session_state.preview = convert_to_preview(image)
         st.image(st.session_state.preview, caption="Preview", use_container_width=True)
 
-    if st.button("🔍 Analyse image and create NeXus"):
-        image_array = st.session_state.get("image_array")
-        if image_array is None:
-            st.error("Please upload an image first.")
+        # === Metadata extraction ===
+        instrument_metadata = {}
+        filename = getattr(file, "name", "")
+        if filename.lower().endswith((".tif", ".tiff")):
+            instrument_metadata = extract_metadata_from_tiff(file)
+
+        if not instrument_metadata and header:
+            instrument_metadata = extract_metadata_from_json_header(header)
+
+        if not instrument_metadata:
+            st.error("❌ No metadata found. Please upload a TIFF with metadata or a separate JSON file.")
             st.stop()
 
         instrument = meta.get("instrument", "").lower().strip()
-        existing = get_mapping(instrument)
+        existing_mapping = get_mapping(instrument)
 
-        if existing:
-            st.info("📁 Using saved mapping from database.")
-            try:
-                nexus_path = Path(tempfile.mkstemp(suffix=".nxs")[1])
-                generate_nexus_file(
-                    image_array=image_array,  # or stack if in stack workflow
-                    fields=existing["fields"],
-                    definition=existing["definition"],
-                    output_path=nexus_path
-                )
-                st.success("✅ NeXus file created from saved mapping.")
-                st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="output.nxs")
-                validation_msg = validate_nexus_file(nexus_path)
-                st.markdown("### ✅ NeXus File Validation")
-                st.code(validation_msg)
-            except Exception as e:
-                st.error(f"Failed to generate NeXus file: {e}")
-            st.stop()
+        if not existing_mapping:
+            if st.button("🤖 Analyze metadata with LLM"):
+                prompt = f"""
+You are a FAIRmat metadata assistant.
 
-        # Fallback to LLM if no mapping exists
-        prompt = f"""
-You are an expert on NeXus data standards and microscopy metadata.
+Given the following raw metadata from an instrument:
+{json.dumps(instrument_metadata, indent=2)}
 
-Your tasks:
-1. Guess the correct NeXus application definition based on:
-   - Image shape: {image_array.shape}
-   - User-provided metadata: {json.dumps(meta, indent=2)}
-2. Use FAIRmat ontologies and NeXus-compliant fields to construct a valid JSON response.
+And the shape of the image: {image.shape}
 
-Important rules:
-- Only include fields that are non-empty or can be inferred.
-- Any required fields that are missing or empty (e.g. "instrument": "") must be listed under "missing".
-- Do not include explanation, markdown, or comments.
+1. Search through the FAIRmat GitHub repositories:
+   - https://github.com/FAIRmat-NFDI/nexus_definitions/tree/fairmat/applications
+   - https://github.com/FAIRmat-NFDI/nexus_definitions/tree/fairmat/contributed_definitions
 
-Return only one of the following formats:
+2. Choose the most appropriate NeXus application definition that fits the image and metadata.
+3. Match the instrument metadata keys to the standard ontology terms defined in the application definition.
+4. Return a JSON with the definition and mapping only.
 
-1. If sufficient fields:
+Respond only as:
 {{
   "definition": "NXmicroscopy",
-  "fields": {{
-    "sample_id": "S123",
-    "image_size_x": 1183,
-    "image_size_y": 1024,
-    "pixel_size": 0.65,
-    "units": "photons"
+  "mapping": {{
+    "instrument_key1": "nexus_key1"
   }}
 }}
+"""
+                with st.spinner("Querying LLM for application definition and mapping..."):
+                    raw = query_ollama(prompt, model=selected_model)
+                    cleaned = extract_json_from_text(raw)
+                try:
+                    mapping_response = json.loads(cleaned)
+                    definition = mapping_response.get("definition", "NXmicroscopy")
+                    mapping = mapping_response.get("mapping", {})
+                    save_mapping(instrument, {"definition": definition, "mapping": mapping})
+                    st.success("✅ Mapping saved to DB.")
+                except Exception as e:
+                    st.error(f"Failed to parse LLM response: {e}")
+                    st.code(raw)
+                    st.stop()
+            else:
+                st.stop()
+        else:
+            st.info("📁 Loaded existing mapping from database.")
+            definition = existing_mapping.get("definition", "NXmicroscopy")
+            mapping = existing_mapping.get("mapping") or existing_mapping.get("fields", {})
 
-2. If fields are missing:
+        standard_metadata = build_standard_metadata(mapping, instrument_metadata)
+
+        # === Missing metadata check (runs only once) ===
+        if f"checked_missing_{workflow}" not in st.session_state:
+            check_missing_prompt = f"""
+You are a FAIRmat metadata assistant.
+
+Given the following metadata extracted from an instrument:
+{json.dumps(standard_metadata, indent=2)}
+
+And the required ontology for the application definition '{definition}' (as defined in FAIRmat NeXus specifications):
+
+1. Compare the provided metadata against the required fields in the application definition.
+2. Return a JSON array of any **missing required fields**.
+
+Only respond with JSON. For example:
+
+If fields are missing:
 {{
-  "missing": ["instrument", "pixel_size", "operator"]
+  "missing": ["instrument", "operator", "pixel_size"]
+}}
+
+If nothing is missing:
+{{
+  "missing": []
 }}
 """
+            with st.spinner("Analyzing required metadata via LLM..."):
+                raw_missing = query_ollama(check_missing_prompt, model=selected_model)
+                cleaned_missing = extract_json_from_text(raw_missing)
+            try:
+                missing_response = json.loads(cleaned_missing)
+                st.session_state.missing_fields = missing_response.get("missing", [])
+                st.session_state[f"checked_missing_{workflow}"] = True
+            except Exception as e:
+                st.warning(f"⚠️ Failed to check for missing fields: {e}")
+                st.session_state.missing_fields = []
+                st.session_state[f"checked_missing_{workflow}"] = True
 
+        # === Ask user for missing fields ===
+        if st.session_state.get("missing_fields"):
+            st.warning("⚠️ Some required metadata is missing:")
+            for field in st.session_state["missing_fields"]:
+                value = st.text_input(f"➕ Provide value for '{field}':", key=f"missing_{field}")
+                if value:
+                    standard_metadata[field] = value
 
-        with st.spinner("Querying LLM..."):
-            raw = query_ollama(prompt, model=selected_model)
-            cleaned = extract_json_from_text(raw)
+        all_filled = all(standard_metadata.get(field) for field in st.session_state.get("missing_fields", []))
 
-        try:
-            response_json = json.loads(cleaned)
-        except json.JSONDecodeError:
-            st.error("LLM did not return valid JSON:")
-            st.code(raw)
-            st.stop()
-
-        if "missing" in response_json:
-            st.session_state.missing_fields = response_json["missing"]
-        elif "definition" in response_json and "fields" in response_json:
-            # Save the new mapping
-            save_mapping(instrument, {"definition": response_json["definition"],"fields": response_json["fields"]})
-
+        if all_filled and st.button("📦 Generate NeXus File"):
             try:
                 nexus_path = Path(tempfile.mkstemp(suffix=".nxs")[1])
                 generate_nexus_file(
-                    image_array=image_array,
-                    fields=response_json["fields"],
-                    definition=response_json["definition"],
+                    image_array=image,
+                    fields=standard_metadata,
+                    definition=definition,
                     output_path=nexus_path
                 )
-
                 st.success("✅ NeXus file created!")
                 st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="output.nxs")
                 validation_msg = validate_nexus_file(nexus_path)
                 st.markdown("### ✅ NeXus File Validation")
                 st.code(validation_msg)
-
                 try:
                     nx = nxload(str(nexus_path))
                     st.subheader("📁 NeXus File Tree")
@@ -179,130 +202,140 @@ Return only one of the following formats:
                     st.warning(f"Could not parse NeXus file: {e}")
             except Exception as e:
                 st.error(f"Failed to generate NeXus file: {e}")
-        else:
-            st.warning("Unexpected response:")
-            st.code(cleaned)
 
-# === STACK WORKFLOW ===
+# === STACK IMAGE WORKFLOW ===
 elif workflow == "Reference a stack (folder / S3 URL)":
-    path = st.text_input("📂 Folder or S3 path", key="stack_path")
-    if st.button("🚀 Analyse stack"):
+    stack_path = st.text_input("📁 Enter local folder path or MinIO S3 bucket URI:")
+
+    if st.button("🔍 Load Image Stack") and stack_path:
         try:
-            files = sorted(Path(path).glob("*.tif"))
+            if stack_path.startswith("s3://"):
+                st.warning("⚠️ MinIO support not implemented yet. Please use a local path.")
+                st.stop()
+            files = sorted(Path(stack_path).glob("*.tif"))
             stack = np.stack([read_image_any_format(f) for f in files])
-            preview = convert_to_preview(stack[0])
-            st.image(preview, caption="First frame", use_container_width=True)
+            image = stack
+            st.image(convert_to_preview(stack[0]), caption="Preview - First Frame", use_container_width=True)
         except Exception as e:
-            st.error(f"Failed to load image stack: {e}")
+            st.error(f"❌ Failed to load image stack: {e}")
+            st.stop()
+
+        instrument_metadata = extract_metadata_from_tiff(files[0]) if files else {}
+
+        if not instrument_metadata:
+            st.warning("⚠️ No metadata found in stack images.")
             st.stop()
 
         instrument = meta.get("instrument", "").lower().strip()
-        existing = get_mapping(instrument)
+        existing_mapping = get_mapping(instrument)
 
-        if existing:
-            st.info("📁 Using saved mapping from database.")
+        if not existing_mapping:
+            prompt = f"""
+You are a FAIRmat metadata assistant.
+
+Given the following raw metadata from a stack image:
+{json.dumps(instrument_metadata, indent=2)}
+
+And stack shape: {stack.shape}
+
+1. Identify the best NeXus application definition from FAIRmat GitHub.
+2. Map the metadata keys to the ontology of that application.
+
+Return:
+{{
+  "definition": "NXmicroscopy",
+  "mapping": {{ "original_key": "nexus_key" }}
+}}
+"""
+            with st.spinner("Querying LLM for application definition and mapping..."):
+                raw = query_ollama(prompt, model=selected_model)
+                cleaned = extract_json_from_text(raw)
+            try:
+                mapping_response = json.loads(cleaned)
+                definition = mapping_response.get("definition", "NXmicroscopy")
+                mapping = mapping_response.get("mapping", {})
+                save_mapping(instrument, {"definition": definition, "mapping": mapping})
+                st.success("✅ Mapping saved to DB.")
+            except Exception as e:
+                st.error(f"Failed to parse LLM response: {e}")
+                st.code(raw)
+                st.stop()
+        else:
+            st.info("📁 Loaded existing mapping from database.")
+            definition = existing_mapping.get("definition", "NXmicroscopy")
+            mapping = existing_mapping.get("mapping") or existing_mapping.get("fields", {})
+
+        standard_metadata = build_standard_metadata(mapping, instrument_metadata)
+
+        # === Missing metadata check (runs only once) ===
+        if "checked_missing" not in st.session_state:
+            check_missing_prompt = f"""
+You are a FAIRmat metadata assistant.
+
+Given the following metadata extracted from an instrument:
+{json.dumps(standard_metadata, indent=2)}
+
+And the required ontology for the application definition '{definition}' (as defined in FAIRmat NeXus specifications):
+
+1. Compare the provided metadata against the required fields in the application definition.
+2. Return a JSON array of any **missing required fields**.
+
+Only respond with JSON. For example:
+
+If fields are missing:
+{{
+  "missing": ["instrument", "operator", "pixel_size"]
+}}
+
+If nothing is missing:
+{{
+  "missing": []
+}}
+"""
+            with st.spinner("Checking for missing metadata via LLM..."):
+                raw_missing = query_ollama(check_missing_prompt, model=selected_model)
+                cleaned_missing = extract_json_from_text(raw_missing)
+            try:
+                missing_response = json.loads(cleaned_missing)
+                st.session_state.missing_fields = missing_response.get("missing", [])
+                st.session_state.checked_missing = True
+            except Exception as e:
+                st.warning(f"⚠️ Failed to check for missing fields: {e}")
+                st.session_state.missing_fields = []
+                st.session_state.checked_missing = True
+
+        # === Ask user for missing fields ===
+        if st.session_state.get("missing_fields"):
+            st.warning("⚠️ Some required metadata is missing:")
+            for field in st.session_state["missing_fields"]:
+                value = st.text_input(f"➕ Provide value for '{field}':", key=f"missing_{field}")
+                if value:
+                    standard_metadata[field] = value
+
+        all_filled = all(standard_metadata.get(field) for field in st.session_state.get("missing_fields", []))
+
+        if all_filled and st.button("📦 Generate NeXus File from Stack"):
             try:
                 nexus_path = Path(tempfile.mkstemp(suffix=".nxs")[1])
                 generate_nexus_file(
-                    image_array=image_array,  # or stack if in stack workflow
-                    fields=existing["fields"],
-                    definition=existing["definition"],
+                    image_array=stack,
+                    fields=standard_metadata,
+                    definition=definition,
                     output_path=nexus_path
                 )
-                st.success("✅ NeXus file created from saved mapping.")
-                st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="output.nxs")
+                st.success("✅ NeXus file for stack created!")
+                st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="stack_output.nxs")
                 validation_msg = validate_nexus_file(nexus_path)
                 st.markdown("### ✅ NeXus File Validation")
                 st.code(validation_msg)
+                try:
+                    nx = nxload(str(nexus_path))
+                    st.subheader("📁 NeXus File Tree")
+                    st.text(nx.tree)
+                except Exception as e:
+                    st.warning(f"Could not parse NeXus file: {e}")
             except Exception as e:
                 st.error(f"Failed to generate NeXus file: {e}")
-            st.stop()
-
-        # Fallback to LLM if no mapping exists
-        prompt = f"""
-You are an expert in NeXus data formats and FAIRmat ontologies.
-
-A user has provided a microscopy image **stack** stored at `{path}`.
-Your tasks:
-
-1. Guess the correct NeXus application definition based on:
-   - Image stack shape: {stack.shape}
-   - Metadata: {json.dumps(meta, indent=2)}
-
-2. Extract relevant metadata using FAIRmat/NeXus ontologies:
-   - Use only non-empty, meaningful fields
-   - Represent all metadata with valid NeXus field names and types
-   - If you infer a value (like number of frames or voxel size), include it
-
-3. Return structured JSON. Follow one of these formats strictly:
-
-**A. If metadata is complete:**
-{{
-  "definition": "NXmicroscopy",
-  "fields": {{
-    "sample_id": "ABC123",
-    "instrument": "confocal microscope",
-    "num_frames": {stack.shape[0]},
-    "image_size_x": {stack.shape[-1]},
-    "image_size_y": {stack.shape[-2]},
-    "pixel_size": 0.2,
-    "units": "intensity"
-  }}
-}}
-
-**B. If some metadata is missing or empty:**
-{{
-  "missing": ["instrument", "pixel_size", "acquisition_date"]
-}}
-
-Rules:
-- Do NOT include empty strings in "fields"
-- Do NOT return explanation, markdown, or natural language
-- Always return VALID JSON
-"""
-
-
-        with st.spinner("Querying LLM..."):
-            raw = query_ollama(prompt, model=selected_model)
-            cleaned = extract_json_from_text(raw)
-
-        try:
-            response_json = json.loads(cleaned)
-            if "missing" in response_json:
-                st.session_state.missing_fields = response_json["missing"]
-            elif "definition" in response_json and "fields" in response_json:
-                # Save the new mapping
-                save_mapping(instrument, {"definition": response_json["definition"],"fields": response_json["fields"]})
-
-                nexus_path = Path(tempfile.mkstemp(suffix=".nxs")[1])
-                generate_nexus_file(
-                    image_array=stack,
-                    fields=response_json["fields"],
-                    definition=response_json["definition"],
-                    output_path=nexus_path
-                )
-                st.success("✅ NeXus file created!")
-                st.download_button("⬇️ Download NeXus File", nexus_path.read_bytes(), file_name="stack.nxs")
-                validation_msg = validate_nexus_file(nexus_path)
-                st.markdown("### ✅ NeXus File Validation")
-                st.code(validation_msg)
-            else:
-                st.error("Unexpected LLM response:")
-                st.code(cleaned)
-        except Exception as e:
-            st.error(f"LLM did not return valid JSON. Full text:\n{raw}")
-
-# === Missing Fields Handler ===
-if "missing_fields" in st.session_state and st.session_state.missing_fields:
-    st.warning("🚧 Missing required metadata:")
-    ready = True
-    for f in st.session_state.missing_fields:
-        value = st.text_input(f"➕ Provide {f}", key=f"missing_{f}")
-        st.session_state.meta[f] = value
-        if not value.strip():
-            ready = False
-    
-    st.success("✅ Re-run the analysis to continue with the new metadata.")
 
 # === Reset Button ===
 st.markdown("---")

@@ -1,1 +1,1 @@
-{"_default": {"1": {"instrument": "tescan amber x", "mapping": {"definition": "NXmicroscopy", "fields": {"sample_id": "s123", "image_size_x": 1104, "image_size_y": 1024, "pixel_size": 10, "units": "nm"}}}}}
+{"_default": {"1": {"instrument": "", "mapping": {"definition": "NXmicroscopy", "mapping": {}}}}}
