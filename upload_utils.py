@@ -1,15 +1,16 @@
 # upload_utils.py
 
 import requests
-import tifffile
+from tifffile import TiffFile
 import numpy as np
 from io import BytesIO
 import re
-import streamlit as st
 from PIL import Image
 import os
 import json
+import re
 import paramiko
+import string
 from urllib.parse import urlparse
 
 # === File transfer ===
@@ -30,49 +31,116 @@ def send_file_http(local_path, url):
 
 
 # === Utilities ===
-def extract_json_from_text(text):
-    # Extract the first {...} or [...] block that looks like valid JSON
-    match = re.search(r'(\{.*?\}|\[.*?\])', text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
+def fix_common_json_errors(json_str: str) -> str:
+    # Add commas between properties if missing
+    json_str = re.sub(r'("\s*:\s*[^,{}\[\]\n"]+)(\s*")', r'\1,\2', json_str)
+    json_str = re.sub(r'(\})(\s*\{)', r'\1,\2', json_str)
+    json_str = re.sub(r'(?<=\{|,)\s*(\w+)\s*:', r'"\1":', json_str)
+    return json_str
+
+def extract_json_from_response(text) -> dict:
+    if isinstance(text, dict):
+        return text
+
+    if not isinstance(text, str):
+        raise ValueError(f"Expected string or dict, got {type(text)}")
+
+    try:
+        # 1. Remove markdown code fences if present
+        text = re.sub(r"^```json\s*|```$", "", text, flags=re.IGNORECASE).strip()
+
+        # 2. Clean non-printable characters (likely binary garbage)
+        text = ''.join(ch for ch in text if ch in string.printable)
+
+        # 3. Use brace matching to extract the first valid JSON block
+        brace_count = 0
+        json_start = None
+        for i, ch in enumerate(text):
+            if ch == '{':
+                if json_start is None:
+                    json_start = i
+                brace_count += 1
+            elif ch == '}':
+                brace_count -= 1
+                if brace_count == 0 and json_start is not None:
+                    json_candidate = text[json_start:i+1]
+                    break
+        else:
+            raise ValueError("No complete JSON object found in response.")
+
+        # 4. Attempt to parse
+        return json.loads(json_candidate)
+
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to decode JSON: {e}")
+    except Exception as e:
+        raise ValueError(f"Unexpected error during JSON extraction: {e}")
+
+def make_json_safe(obj):
+    """Recursively convert non-serializable values to strings."""
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_json_safe(i) for i in obj]
+    elif isinstance(obj, (int, float, str, type(None), bool)):
+        return obj
+    else:
+        return str(obj)
 
 def read_image_any_format(file) -> np.ndarray:
-    # Try TIFF first
     try:
-        file.seek(0)
-        arr = tifffile.imread(file)
-        arr = np.asarray(arr)
+        return tifffile.imread(file)
     except Exception:
-        # Fallback: PNG/JPEG etc.
-        file.seek(0)
-        image = Image.open(BytesIO(file.read())).convert("RGB")  # Enforce 3 channels
-        arr = np.asarray(image)
+        return np.array(Image.open(file))
 
-    # Enforce numeric dtype
-    if arr.dtype == object:
-        arr = arr.astype(np.uint8)
-
-    return arr
-
-
-def convert_to_preview(arr: np.ndarray) -> np.ndarray:
+def convert_to_preview(arr):
     arr = np.asarray(arr)
-
-    if arr.ndim == 3:
-        if arr.shape[-1] == 4:
-            arr = arr[..., :3]
-        elif arr.shape[-1] == 1:
-            arr = arr[..., 0]
-        elif arr.shape[-1] != 3:
-            raise ValueError(f"Unsupported 3D image shape: {arr.shape}")
+    if arr.ndim == 3 and arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    if arr.ndim == 3 and arr.shape[-1] == 3:
         return arr.astype(np.uint8)
-
-    elif arr.ndim == 2:
+    if arr.ndim == 2:
         arr = arr.astype(np.float32)
-        return ((arr - np.min(arr)) / (np.ptp(arr) + 1e-6) * 255).astype(np.uint8)
-
+        return ((arr - np.min(arr)) / np.ptp(arr) * 255).astype(np.uint8)
     raise ValueError(f"Unsupported image shape: {arr.shape}")
+
+def build_llm_prompt(pretty_metadata: str, image_shape) -> str:
+    return f"""
+You are a FAIRmat metadata assistant.
+
+Given the following raw metadata from an instrument:
+{pretty_metadata}
+
+And the shape of the image: {image_shape}
+
+Your task:
+1. Choose the most appropriate NeXus application definition from:
+   - https://github.com/FAIRmat-NFDI/nexus_definitions/tree/fairmat/applications
+   - https://github.com/FAIRmat-NFDI/nexus_definitions/tree/fairmat/contributed_definitions
+
+Available definitions:
+- NXtomo, NXstxm, NXmx, NXmicroscopy, NXapm, NXem
+
+2. Map metadata keys to their corresponding NeXus ontology paths.
+
+Respond with a single valid JSON object:
+{{
+  "definition": "NXmicroscopy",
+  "mapping": {{
+    "Voltage": "NXinstrument/acceleration_voltage",
+    "PixelSize": "NXinstrument/NXdetector/pixel_size"
+  }}
+}}
+
+⚠️ No markdown, no comments, no explanations. Use double quotes and commas. If unsure, return:
+{{
+  "definition": "NXmicroscopy",
+  "mapping": {{}}
+}}
+"""
+
 
 def get_ollama_models(host=None):
     try:
@@ -107,19 +175,19 @@ def query_ollama(prompt, model, host=None):
     except Exception as e:
         return f'{{"error": "Ollama request failed: {str(e)}"}}'
 
-def extract_metadata_from_tiff(file) -> dict:
-    try:
-        file.seek(0)  # Reset file pointer to beginning
-        with tifffile.TiffFile(file) as tif:
-            tags = {
-                tag.name: str(tag.value)
-                for tag in tif.pages[0].tags.values()
-                if tag.value is not None and str(tag.value).strip() != ""
-            }
-        return tags
-    except Exception as e:
-        print("⚠️ TIFF metadata extraction failed:", e)
-        return {}
+def extract_metadata_from_tiff(uploaded_file) -> dict:
+
+    uploaded_file.seek(0)                 # REWIND — critical!
+    meta = {}
+
+    with TiffFile(BytesIO(uploaded_file.read())) as tif:
+        tags = tif.pages[0].tags
+        for tag in tags.values():
+            try:
+                meta[tag.name] = tag.value
+            except Exception:
+                continue
+    return meta
 
 def extract_metadata_from_json_header(file) -> dict:
     try:
