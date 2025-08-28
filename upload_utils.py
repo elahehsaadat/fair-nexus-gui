@@ -106,41 +106,6 @@ def convert_to_preview(arr):
         return ((arr - np.min(arr)) / np.ptp(arr) * 255).astype(np.uint8)
     raise ValueError(f"Unsupported image shape: {arr.shape}")
 
-def build_llm_prompt(pretty_metadata: str, image_shape) -> str:
-    return f"""
-You are a FAIRmat metadata assistant.
-
-Given the following raw metadata from an instrument:
-{pretty_metadata}
-
-And the shape of the image: {image_shape}
-
-Your task:
-1. Choose the most appropriate NeXus application definition from:
-   - https://github.com/FAIRmat-NFDI/nexus_definitions/tree/fairmat/applications
-   - https://github.com/FAIRmat-NFDI/nexus_definitions/tree/fairmat/contributed_definitions
-
-Available definitions:
-- NXtomo, NXstxm, NXmx, NXmicroscopy, NXapm, NXem
-
-2. Map metadata keys to their corresponding NeXus ontology paths.
-
-Respond with a single valid JSON object:
-{{
-  "definition": "NXmicroscopy",
-  "mapping": {{
-    "Voltage": "NXinstrument/acceleration_voltage",
-    "PixelSize": "NXinstrument/NXdetector/pixel_size"
-  }}
-}}
-
-⚠️ No markdown, no comments, no explanations. Use double quotes and commas. If unsure, return:
-{{
-  "definition": "NXmicroscopy",
-  "mapping": {{}}
-}}
-"""
-
 
 def get_ollama_models(host=None):
     try:

@@ -1,0 +1,36 @@
+{
+  "TESCAN | NXem": {
+    "mapping": {
+      "ImageWidth": "NXentry/start_time",
+      "ImageLength": "NXentry/start_time",
+      "BitsPerSample": "NXentry/start_time",
+      "Compression": "NXentry/start_time",
+      "PhotometricInterpretation": "NXentry/start_time",
+      "Make": "NXentry/start_time",
+      "Model": "NXentry/start_time",
+      "StripOffsets": "NXentry/start_time",
+      "Orientation": "NXentry/start_time",
+      "SamplesPerPixel": "NXentry/start_time",
+      "RowsPerStrip": "NXentry/start_time",
+      "StripByteCounts": "NXentry/start_time",
+      "PlanarConfiguration": "NXentry/start_time",
+      "Artist": "NXentry/start_time",
+      "50431": "NXentry/start_time"
+    },
+    "definition": "NXem",
+    "instrument": "TESCAN",
+    "updated_at": "2025-08-28T13:24:05.096054Z"
+  },
+  "TESCAN Amber X | NXem": {
+    "mapping": {
+      "ImageWidth": "NXentry",
+      "Make": "NXentry/NXsample/description",
+      "RowsPerStrip": "NXentry/NXsample/description",
+      "DateTime": "NXentry/NXcoordinate_system/origin",
+      "50431": "NXentry"
+    },
+    "definition": "NXem",
+    "instrument": "TESCAN Amber X",
+    "updated_at": "2025-08-28T14:20:00.045289Z"
+  }
+}
