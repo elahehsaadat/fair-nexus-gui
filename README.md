@@ -53,7 +53,7 @@ pip install -r requirements.txt (pip install --only-binary=:all: -r requirements
 
 
 # Tunnel to ORFEO (if using remote LLM)
-access to ollama on orfeo "ssh -L 11434:10.128.2.165:11434 orfeo"
+access to ollama on orfeo "ssh -L 11434:10.128.2.154:11434 orfeo"
 echo "OLLAMA_BASE_URL=http://localhost:11434" > .env # adjust for remote
 
 # Run the app
