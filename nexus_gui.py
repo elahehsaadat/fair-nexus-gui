@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from collections import Counter
+import numpy as np
+import hashlib
 
 from upload_utils import (
     get_ollama_models,
@@ -22,26 +24,12 @@ from upload_utils import (
 # =========================================
 # Constants (keep it simple)
 # =========================================
-# ✅ Set the number of candidate paths sent to the LLM per key to 50
+# ✅ Number of candidate paths sent to the LLM per key
 PER_KEY_CANDIDATE_LIMIT = 50  # fixed; not shown in the UI
 
-# ==============================
-# Utility: tokenization helpers
-# ==============================
-_WORD_RE = re.compile(r"[a-z0-9_]+")
-
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", text.lower()).strip()
-
-def _tok(text: str) -> list[str]:
-    return _WORD_RE.findall(_norm(text))
-
-def _bigrams(tokens: list[str]) -> set[tuple[str, str]]:
-    return {(tokens[i], tokens[i+1]) for i in range(len(tokens)-1)} if len(tokens) >= 2 else set()
-
-# ==============================
-# Robust JSON extraction helper
-# ==============================
+# =========================================
+# JSON extraction helper
+# =========================================
 def robust_json_from_text(text: str) -> dict:
     m = re.search(r'\{.*?\}', text, flags=re.S)
     if not m:
@@ -131,175 +119,7 @@ Correct response examples:
     )
 
 # ==============================
-# Helpers for mapping
-# ==============================
-def flatten_metadata_keys(data, parent=""):
-    keys = []
-    if isinstance(data, dict):
-        for k, v in data.items():
-            path = f"{parent}.{k}" if parent else k
-            keys.extend(flatten_metadata_keys(v, path))
-    elif isinstance(data, list):
-        keys.append(parent)
-    else:
-        keys.append(parent)
-    return list(dict.fromkeys(keys))
-
-def get_value_preview(data: dict, dotted_key: str, max_len: int = 240) -> str:
-    try:
-        node = data
-        for part in dotted_key.split("."):
-            if isinstance(node, dict):
-                node = node.get(part, None)
-            else:
-                node = None
-                break
-        s = repr(node)
-    except Exception:
-        s = "None"
-    if s is None:
-        s = "None"
-    s = str(s)
-    return (s[:max_len] + "…") if len(s) > max_len else s
-
-# ==================================================
-# Lexical indexing & ranking for NeXus paths
-# ==================================================
-_GENERIC_LEAVES = {"name", "title", "value", "data", "type", "model"}  # mild penalty
-
-def _split_path_parts(path: str) -> list[str]:
-    # "NXentry/NXobject/NXimage/NXdata/axis_i" -> ["NXentry","NXobject","NXimage","NXdata","axis_i"]
-    return [p for p in path.split("/") if p]
-
-def _build_path_doc_tokens(path: str) -> list[str]:
-    """
-    Build a small 'document' for each path, made from:
-    - full path tokens
-    - leaf token repeated (to upweight leaf matches slightly)
-    """
-    parts = _split_path_parts(path)
-    leaf = parts[-1].lower() if parts else ""
-    toks = []
-    # tokens from all parts
-    for seg in parts:
-        toks.extend(_tok(seg))
-    # repeat leaf once more as a light prior
-    if leaf:
-        toks.extend(_tok(leaf))
-    return toks
-
-def build_path_index(allowed_paths: list[str]) -> list[dict]:
-    """
-    Returns a list of entries:
-      { 'path': str, 'leaf': str, 'tokens': list[str], 'bigrams': set[tuple], 'depth': int }
-    """
-    index = []
-    for p in allowed_paths:
-        if not p or len(p) >= 200:
-            continue
-        parts = _split_path_parts(p)
-        leaf = parts[-1].lower() if parts else ""
-        tokens = _build_path_doc_tokens(p)
-        entry = {
-            "path": p,
-            "leaf": leaf,
-            "tokens": tokens,
-            "bigrams": _bigrams(tokens),
-            "depth": len(parts),
-        }
-        index.append(entry)
-    return index
-
-def _lexical_score(query_tokens: list[str], query_bigrams: set[tuple[str, str]], entry: dict) -> float:
-    """
-    General lexical ranker:
-      - 3 * unigram overlap
-      - 2 * bigram overlap
-      - 1 * substring hits between query terms and path/leaf
-      + 0.25 * depth
-      - 1 if leaf is very generic (unless that exact leaf also appears in query_tokens)
-    """
-    doc_tokens = entry["tokens"]
-    doc_bigrams = entry["bigrams"]
-    leaf = entry["leaf"]
-    depth = entry["depth"]
-    path_l = entry["path"].lower()
-
-    q_counts = Counter(query_tokens)
-    d_counts = Counter(doc_tokens)
-
-    # unigram overlap (weighted by min count)
-    uni = 0
-    for t, qc in q_counts.items():
-        if t in d_counts:
-            uni += min(qc, d_counts[t])
-
-    # bigram overlap
-    bi = len(query_bigrams & doc_bigrams)
-
-    # substring hits
-    sub_hits = 0
-    for t in set(query_tokens):
-        if len(t) >= 3:
-            if t in leaf:
-                sub_hits += 1
-            elif t in path_l:
-                sub_hits += 0.5
-
-    score = 3.0 * uni + 2.0 * bi + 1.0 * sub_hits + 0.25 * min(depth, 12)
-
-    # mild penalty for generic leaves unless explicitly in query
-    if (leaf in _GENERIC_LEAVES) and (leaf not in query_tokens):
-        score -= 1.0
-
-    return score
-
-def make_query_tokens(key: str, value_preview: str, sibling_keys: list[str]) -> tuple[list[str], set[tuple[str, str]]]:
-    # Query text is the key + short value + some sibling keys to give local context
-    sib_snip = " ".join(sibling_keys[:6]) if sibling_keys else ""
-    q_text = f"{key} {value_preview} {sib_snip}"
-    q_tokens = _tok(q_text)
-    q_bigrams = _bigrams(q_tokens)
-    return q_tokens, q_bigrams
-
-def prioritize_paths_lexical(
-    path_index: list[dict],
-    key: str,
-    value_preview: str,
-    sibling_keys: list[str],
-    top_k: int = PER_KEY_CANDIDATE_LIMIT
-) -> list[str]:
-    q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
-    scored = []
-    for entry in path_index:
-        s = _lexical_score(q_tokens, q_bigrams, entry)
-        scored.append((entry["path"], s, entry["depth"]))
-    # sort by score desc, then slightly prefer deeper leaves (already in score), then shorter string
-    scored.sort(key=lambda t: (t[1], t[2], -len(t[0])), reverse=True)
-    return [p for p, _, _ in scored[:top_k]]
-
-def rank_paths_debug_for_key(
-    key: str,
-    path_index: list[dict],
-    value_preview: str,
-    sibling_keys: list[str],
-    top_n: int = 10
-) -> list[tuple[str, float]]:
-    q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
-    scored = []
-    for entry in path_index:
-        s = _lexical_score(q_tokens, q_bigrams, entry)
-        scored.append((entry["path"], s))
-    scored.sort(key=lambda t: (t[1], -len(t[0])), reverse=True)
-    top = scored[:top_n]
-    # pretty print
-    st.markdown(f"**{key} — top {len(top)} candidates**")
-    for i, (p, sc) in enumerate(top, start=1):
-        st.write(f"{i:02d}. {p} — score={int(sc)}")
-    return top
-
-# ==============================
-# LLM per-key prompt
+# LLM prompts for mapping (unchanged)
 # ==============================
 def build_single_key_mapping_prompt(
     definition: str,
@@ -348,6 +168,267 @@ Good examples:
 }}
 """
 
+# ==================================================
+# Embedding-based ranking (NEW)
+# ==================================================
+# We REPLACE lexical ranking with a synonym-expanded, embedding-based ranking.
+# Embeddings here are dummy, deterministic, and offline (hash-based).
+# Later you can swap `embed_text()` with a real embedding model easily.
+
+_EMBED_DIM = 128
+_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+def _tok(text: str) -> list[str]:
+    return _WORD_RE.findall(_norm(text))
+
+def _hash_to_index(token: str, dim: int = _EMBED_DIM) -> int:
+    # deterministic hash -> index in [0, dim)
+    h = hashlib.md5(token.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % dim
+
+def embed_text(text: str, dim: int = _EMBED_DIM) -> np.ndarray:
+    """
+    Dummy embedding:
+      - lowercase, tokenize
+      - hashed token bucket counts
+      - L2 normalized
+    """
+    vec = np.zeros(dim, dtype=np.float32)
+    for t in _tok(text):
+        idx = _hash_to_index(t, dim)
+        vec[idx] += 1.0
+    n = np.linalg.norm(vec)
+    return vec / (n + 1e-9)
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b))
+
+def build_synonym_prompt(key: str) -> str:
+    return f"""
+You are a scientific metadata assistant.
+List up to 8 synonyms or alternative names for the metadata key "{key}".
+Only return JSON of the form:
+{{ "synonyms": ["syn1","syn2","syn3"] }}
+"""
+
+# Simple session cache to avoid recomputing embeddings repeatedly
+def _get_cache_dict(name: str) -> dict:
+    if name not in st.session_state:
+        st.session_state[name] = {}
+    return st.session_state[name]
+
+def get_cached_embedding(text: str) -> np.ndarray:
+    cache = _get_cache_dict("_embed_cache")
+    if text in cache:
+        return cache[text]
+    emb = embed_text(text)
+    cache[text] = emb
+    return emb
+
+def get_synonyms_for_key(key: str, llm_model: str) -> list[str]:
+    try:
+        resp = query_ollama(build_synonym_prompt(key), model=llm_model)
+        try:
+            parsed = extract_json_from_response(resp)
+        except Exception:
+            parsed = robust_json_from_text(resp)
+        syns = parsed.get("synonyms", [])
+        if isinstance(syns, list):
+            # Make sure they are strings, unique, and non-empty
+            syns = [str(s).strip() for s in syns if str(s).strip()]
+            # Cap at 8 (already prompted so, but just in case)
+            syns = syns[:8]
+            return syns
+    except Exception:
+        pass
+    return []
+
+def prioritize_paths_embedding(
+    allowed_paths: list[str],
+    key: str,
+    llm_model: str,
+    top_k: int = PER_KEY_CANDIDATE_LIMIT,
+    show_debug: bool = False
+) -> list[str]:
+    """
+    Rank allowed_paths semantically:
+      - get synonyms from LLM for the key
+      - embed [key + synonyms] (average embedding)
+      - embed each path
+      - cosine similarity, sort desc
+    """
+    synonyms = get_synonyms_for_key(key, llm_model)
+    queries = [key] + synonyms if synonyms else [key]
+
+    # Average embedding for the query bundle (key + synonyms)
+    q_vecs = [get_cached_embedding(q) for q in queries]
+    q_mean = np.mean(q_vecs, axis=0) if q_vecs else embed_text(key)
+
+    # Compute path embeddings once and score
+    scores = []
+    for p in allowed_paths:
+        p_vec = get_cached_embedding(p)
+        sim = cosine_similarity(q_mean, p_vec)
+        scores.append((p, sim))
+
+    scores.sort(key=lambda t: t[1], reverse=True)
+    top = scores[:top_k]
+
+    if show_debug:
+        st.markdown(f"**{key} — top {len(top)} embedding candidates**")
+        for i, (p, sc) in enumerate(top, start=1):
+            st.write(f"{i:02d}. {p} — sim={sc:.3f}")
+        if synonyms:
+            st.caption(f"Synonyms used: {', '.join(synonyms)}")
+
+    return [p for p, _ in top]
+
+# ==================================================
+# (OLD) Lexical indexing & ranking for NeXus paths
+# ==================================================
+# ⚠️ Retained for reference only — now DISABLED/UNUSED.
+# def _bigrams(tokens: list[str]) -> set[tuple[str, str]]:
+#     return {(tokens[i], tokens[i+1]) for i in range(len(tokens)-1)} if len(tokens) >= 2 else set()
+#
+# _GENERIC_LEAVES = {"name", "title", "value", "data", "type", "model"}  # mild penalty
+#
+# def _split_path_parts(path: str) -> list[str]:
+#     return [p for p in path.split("/") if p]
+#
+# def _build_path_doc_tokens(path: str) -> list[str]:
+#     parts = _split_path_parts(path)
+#     leaf = parts[-1].lower() if parts else ""
+#     toks = []
+#     for seg in parts:
+#         toks.extend(_tok(seg))
+#     if leaf:
+#         toks.extend(_tok(leaf))
+#     return toks
+#
+# def build_path_index(allowed_paths: list[str]) -> list[dict]:
+#     index = []
+#     for p in allowed_paths:
+#         if not p or len(p) >= 200:
+#             continue
+#         parts = _split_path_parts(p)
+#         leaf = parts[-1].lower() if parts else ""
+#         tokens = _build_path_doc_tokens(p)
+#         entry = {
+#             "path": p,
+#             "leaf": leaf,
+#             "tokens": tokens,
+#             "bigrams": _bigrams(tokens),
+#             "depth": len(parts),
+#         }
+#         index.append(entry)
+#     return index
+#
+# def _lexical_score(query_tokens: list[str], query_bigrams: set[tuple[str, str]], entry: dict) -> float:
+#     doc_tokens = entry["tokens"]
+#     doc_bigrams = entry["bigrams"]
+#     leaf = entry["leaf"]
+#     depth = entry["depth"]
+#     path_l = entry["path"].lower()
+#
+#     q_counts = Counter(query_tokens)
+#     d_counts = Counter(doc_tokens)
+#
+#     uni = 0
+#     for t, qc in q_counts.items():
+#         if t in d_counts:
+#             uni += min(qc, d_counts[t])
+#
+#     bi = len(query_bigrams & doc_bigrams)
+#
+#     sub_hits = 0
+#     for t in set(query_tokens):
+#         if len(t) >= 3:
+#             if t in leaf:
+#                 sub_hits += 1
+#             elif t in path_l:
+#                 sub_hits += 0.5
+#
+#     score = 3.0 * uni + 2.0 * bi + 1.0 * sub_hits + 0.25 * min(depth, 12)
+#     if (leaf in _GENERIC_LEAVES) and (leaf not in query_tokens):
+#         score -= 1.0
+#     return score
+#
+# def make_query_tokens(key: str, value_preview: str, sibling_keys: list[str]) -> tuple[list[str], set[tuple[str, str]]]:
+#     sib_snip = " ".join(sibling_keys[:6]) if sibling_keys else ""
+#     q_text = f"{key} {value_preview} {sib_snip}"
+#     q_tokens = _tok(q_text)
+#     q_bigrams = _bigrams(q_tokens)
+#     return q_tokens, q_bigrams
+#
+# def prioritize_paths_lexical(
+#     path_index: list[dict],
+#     key: str,
+#     value_preview: str,
+#     sibling_keys: list[str],
+#     top_k: int = PER_KEY_CANDIDATE_LIMIT
+# ) -> list[str]:
+#     q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
+#     scored = []
+#     for entry in path_index:
+#         s = _lexical_score(q_tokens, q_bigrams, entry)
+#         scored.append((entry["path"], s, entry["depth"]))
+#     scored.sort(key=lambda t: (t[1], t[2], -len(t[0])), reverse=True)
+#     return [p for p, _, _ in scored[:top_k]]
+#
+# def rank_paths_debug_for_key(
+#     key: str,
+#     path_index: list[dict],
+#     value_preview: str,
+#     sibling_keys: list[str],
+#     top_n: int = 10
+# ) -> list[tuple[str, float]]:
+#     q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
+#     scored = []
+#     for entry in path_index:
+#         s = _lexical_score(q_tokens, q_bigrams, entry)
+#         scored.append((entry["path"], s))
+#     scored.sort(key=lambda t: (t[1], -len(t[0])), reverse=True)
+#     top = scored[:top_n]
+#     st.markdown(f"**{key} — top {len(top)} candidates**")
+#     for i, (p, sc) in enumerate(top, start=1):
+#         st.write(f"{i:02d}. {p} — score={int(sc)}")
+#     return top
+
+# ==============================
+# Helpers for mapping (unchanged)
+# ==============================
+def flatten_metadata_keys(data, parent=""):
+    keys = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            path = f"{parent}.{k}" if parent else k
+            keys.extend(flatten_metadata_keys(v, path))
+    elif isinstance(data, list):
+        keys.append(parent)
+    else:
+        keys.append(parent)
+    return list(dict.fromkeys(keys))
+
+def get_value_preview(data: dict, dotted_key: str, max_len: int = 240) -> str:
+    try:
+        node = data
+        for part in dotted_key.split("."):
+            if isinstance(node, dict):
+                node = node.get(part, None)
+            else:
+                node = None
+                break
+        s = repr(node)
+    except Exception:
+        s = "None"
+    if s is None:
+        s = "None"
+    s = str(s)
+    return (s[:max_len] + "…") if len(s) > max_len else s
+
 # ==============================
 # NXDL filesystem + XML parsing
 # ==============================
@@ -366,7 +447,7 @@ EXPERIMENT_TO_NX = {
     "MX": "NXmx",
     "APT": "NXapm",
     "Transport": "NXiv_temp",
-    "Other": "NXem",  # keep a real NXDL as fallback
+    "Other": "Other",  # keep a real NXDL as fallback
 }
 
 BASE_DIR = Path(__file__).parent if '__file__' in globals() else Path.cwd()
@@ -647,7 +728,7 @@ if workflow == "Upload image + metadata":
                 st.code("\n".join(aps[:60]), language="text")  # sample preview only
 
         # ==============================
-        # 🧭 Map keys → NeXus paths  (with DB cache + lexical ranking)
+        # 🧭 Map keys → NeXus paths  (DB cache + EMBEDDING RANKING)
         # ==============================
         st.subheader("🧭 Map metadata keys to NeXus paths")
 
@@ -688,9 +769,6 @@ if workflow == "Upload image + metadata":
                 else:
                     st.info("Ignoring cache and re-mapping with LLM...")
 
-            # Build lexical index once for this NXDL
-            path_index = build_path_index(aps)
-
             # No cache or user chose to recompute
             meta_keys = flatten_metadata_keys(safe_md)
 
@@ -723,27 +801,14 @@ if workflow == "Upload image + metadata":
                     status.write(f"Processing {idx}/{len(keys_to_map)}: **{key}**")
                     value_preview = get_value_preview(safe_md, key)
 
-                    # pick a few sibling keys to give local context in the query
-                    sibling_keys = [k for k in keys_to_map if k != key][:8]
-
-                    # Lexical candidate pool (TOP 50 now)
-                    allowed_subset = prioritize_paths_lexical(
-                        path_index=path_index,
+                    # 🔵 Embedding-based candidate pool (TOP 50)
+                    allowed_subset = prioritize_paths_embedding(
+                        allowed_paths=aps,
                         key=key,
-                        value_preview=value_preview,
-                        sibling_keys=sibling_keys,
-                        top_k=PER_KEY_CANDIDATE_LIMIT
+                        llm_model=selected_model,
+                        top_k=PER_KEY_CANDIDATE_LIMIT,
+                        show_debug=show_rank_debug
                     )
-
-                    # Optional backend checkpoint
-                    if show_rank_debug:
-                        rank_paths_debug_for_key(
-                            key=key,
-                            path_index=path_index,
-                            value_preview=value_preview,
-                            sibling_keys=sibling_keys,
-                            top_n=PER_KEY_CANDIDATE_LIMIT
-                        )
 
                     prompt = build_single_key_mapping_prompt(
                         definition=definition,
