@@ -5,10 +5,8 @@ import re
 from pathlib import Path
 from dotenv import load_dotenv
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import Counter
-import numpy as np
-import hashlib
 
 from upload_utils import (
     get_ollama_models,
@@ -22,16 +20,24 @@ from upload_utils import (
 )
 
 # =========================================
-# Constants (keep it simple)
+# Constants
 # =========================================
-# ✅ Number of candidate paths sent to the LLM per key
 PER_KEY_CANDIDATE_LIMIT = 50  # fixed; not shown in the UI
+_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+BASE_DIR = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+env_root = os.getenv("NEXUS_DEFINITIONS_ROOT", "").strip()
+DEF_ROOT = Path(env_root) if env_root else (BASE_DIR / "nexus_definitions")
+APP_DIRS = [DEF_ROOT / "applications", DEF_ROOT / "contributed_definitions"]
+
+# Folder where you put curated example mappings (per-instrument)
+EXAMPLE_MAPPINGS_DIR = BASE_DIR / "example_mappings"
 
 # =========================================
 # JSON extraction helper
 # =========================================
 def robust_json_from_text(text: str) -> dict:
-    m = re.search(r'\{.*?\}', text, flags=re.S)
+    m = re.search(r"\{.*?\}", text, flags=re.S)
     if not m:
         raise ValueError("No JSON object found in response")
     candidate = m.group(0)
@@ -41,9 +47,9 @@ def robust_json_from_text(text: str) -> dict:
     decoder = json.JSONDecoder(strict=False)
     return decoder.decode(candidate)
 
-# ==============================
+# =========================================
 # Prompt builders (instrument & experiment)
-# ==============================
+# =========================================
 def build_instrument_detection_prompt(pretty_metadata: str) -> str:
     return (
         """
@@ -77,6 +83,7 @@ or if missing:
 }
 """
     )
+
 
 def build_experiment_type_prompt(pretty_metadata: str, instrument_name: str) -> str:
     return (
@@ -118,25 +125,44 @@ Correct response examples:
 """
     )
 
-# ==============================
-# LLM prompts for mapping (unchanged)
-# ==============================
+# =========================================
+# LLM prompt for mapping (with examples)
+# =========================================
 def build_single_key_mapping_prompt(
     definition: str,
     selected_key: str,
     value_preview: str,
     allowed_subset: list[str],
-    metadata_context_snippet: str
+    metadata_context_snippet: str,
+    example_pairs: list[tuple[str, str]],
 ) -> str:
     allowed_text = "\n".join("- " + p for p in allowed_subset) if allowed_subset else "- (no paths)"
+
+    if example_pairs:
+        example_lines = "\n".join(
+            f'- "{k}" → "{p}"' for (k, p) in example_pairs
+        )
+        examples_block = f"""
+Example mappings from other {definition} instruments
+(metadata key → NeXus path):
+{example_lines}
+
+Use these as guidance: if the current key is similar to an example key,
+prefer a NeXus path that plays an analogous role.
+"""
+    else:
+        examples_block = "\n(No example mappings available for this key.)\n"
+
     return f"""
 You are a FAIRmat metadata assistant.
 
 Goal:
 Given ONE metadata key and its value, pick the **best matching NeXus path** from the allowed list.
-If there is **no clear match**, you MUST return an empty string "".
-❌ Do not guess.
-❌ Do not invent new paths.
+
+Important:
+- You should **prefer choosing the best candidate** over returning an empty string.
+- Return "" only if **none** of the allowed paths are meaningfully related to this metadata key.
+- It is acceptable to make a reasonable choice when multiple paths are plausible.
 
 Selected NeXus application:
 {definition}
@@ -148,257 +174,159 @@ Metadata key to map:
 - key: "{selected_key}"
 - value preview: {value_preview}
 
+{examples_block}
+
 Allowed NeXus paths (choose at most one; do NOT invent):
 {allowed_text}
 
-Strict rules:
+Strict output rules:
 - Output ONLY JSON (no prose), with this exact shape:
   {{
     "mapping": {{"{selected_key}": "<one_allowed_path_or_empty>"}}
   }}
-- If no path clearly matches, return "".
+- The chosen path MUST be one of the allowed paths above (or "").
+- You may reuse a path from the examples if it is also present in the allowed list.
 - Prefer the most specific field if multiple are reasonable.
-
-Good examples:
-{{
-  "mapping": {{"DateTime": "NXentry/start_time"}}
-}}
-{{
-  "mapping": {{"ImageWidth": ""}}
-}}
 """
 
 # ==================================================
-# Embedding-based ranking (NEW)
+# Tokenisation helper
 # ==================================================
-# We REPLACE lexical ranking with a synonym-expanded, embedding-based ranking.
-# Embeddings here are dummy, deterministic, and offline (hash-based).
-# Later you can swap `embed_text()` with a real embedding model easily.
-
-_EMBED_DIM = 128
-_WORD_RE = re.compile(r"[a-z0-9_]+")
-
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
+
 
 def _tok(text: str) -> list[str]:
     return _WORD_RE.findall(_norm(text))
 
-def _hash_to_index(token: str, dim: int = _EMBED_DIM) -> int:
-    # deterministic hash -> index in [0, dim)
-    h = hashlib.md5(token.encode("utf-8")).hexdigest()
-    return int(h[:8], 16) % dim
+# ==================================================
+# Lexical ranking of NeXus paths
+# ==================================================
+_GENERIC_LEAVES = {"name", "title", "value", "data", "type", "model"}  # mild penalty
 
-def embed_text(text: str, dim: int = _EMBED_DIM) -> np.ndarray:
+
+def _bigrams(tokens: list[str]) -> set[tuple[str, str]]:
+    return {(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)} if len(tokens) >= 2 else set()
+
+
+def _split_path_parts(path: str) -> list[str]:
+    return [p for p in path.split("/") if p]
+
+
+def _build_path_doc_tokens(path: str) -> list[str]:
+    parts = _split_path_parts(path)
+    leaf = parts[-1].lower() if parts else ""
+    toks = []
+    for seg in parts:
+        toks.extend(_tok(seg))
+    if leaf:
+        toks.extend(_tok(leaf))
+    return toks
+
+
+def build_path_index(allowed_paths: list[str]) -> list[dict]:
+    index = []
+    for p in allowed_paths:
+        if not p or len(p) >= 200:
+            continue
+        parts = _split_path_parts(p)
+        leaf = parts[-1].lower() if parts else ""
+        tokens = _build_path_doc_tokens(p)
+        entry = {
+            "path": p,
+            "leaf": leaf,
+            "tokens": tokens,
+            "bigrams": _bigrams(tokens),
+            "depth": len(parts),
+        }
+        index.append(entry)
+    return index
+
+
+def _lexical_score(query_tokens: list[str], query_bigrams: set[tuple[str, str]], entry: dict) -> float:
+    doc_tokens = entry["tokens"]
+    doc_bigrams = entry["bigrams"]
+    leaf = entry["leaf"]
+    depth = entry["depth"]
+    path_l = entry["path"].lower()
+
+    q_counts = Counter(query_tokens)
+    d_counts = Counter(doc_tokens)
+
+    # unigram overlap
+    uni = 0
+    for t, qc in q_counts.items():
+        if t in d_counts:
+            uni += min(qc, d_counts[t])
+
+    # bigram overlap
+    bi = len(query_bigrams & doc_bigrams)
+
+    # substring hits (e.g., width in /image_width/)
+    sub_hits = 0
+    for t in set(query_tokens):
+        if len(t) >= 3:
+            if t in leaf:
+                sub_hits += 1
+            elif t in path_l:
+                sub_hits += 0.5
+
+    score = 3.0 * uni + 2.0 * bi + 1.0 * sub_hits + 0.25 * min(depth, 12)
+
+    # penalize very generic leaf names if they don't appear in the query
+    if (leaf in _GENERIC_LEAVES) and (leaf not in query_tokens):
+        score -= 1.0
+    return score
+
+
+def make_query_tokens(key: str, value_preview: str, sibling_keys: list[str]) -> tuple[list[str], set[tuple[str, str]]]:
+    sib_snip = " ".join(sibling_keys[:6]) if sibling_keys else ""
+    q_text = f"{key} {value_preview} {sib_snip}"
+    q_tokens = _tok(q_text)
+    q_bigrams = _bigrams(q_tokens)
+    return q_tokens, q_bigrams
+
+
+def _get_path_index_for_definition(allowed_paths: list[str], definition: str) -> list[dict]:
     """
-    Dummy embedding:
-      - lowercase, tokenize
-      - hashed token bucket counts
-      - L2 normalized
+    Cache a path index per definition in the session state.
     """
-    vec = np.zeros(dim, dtype=np.float32)
-    for t in _tok(text):
-        idx = _hash_to_index(t, dim)
-        vec[idx] += 1.0
-    n = np.linalg.norm(vec)
-    return vec / (n + 1e-9)
+    key_idx = "_path_index"
+    key_def = "_path_index_definition"
+    if (key_idx not in st.session_state) or (st.session_state.get(key_def) != definition):
+        st.session_state[key_idx] = build_path_index(allowed_paths)
+        st.session_state[key_def] = definition
+    return st.session_state[key_idx]
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))
 
-def build_synonym_prompt(key: str) -> str:
-    return f"""
-You are a scientific metadata assistant.
-List up to 8 synonyms or alternative names for the metadata key "{key}".
-Only return JSON of the form:
-{{ "synonyms": ["syn1","syn2","syn3"] }}
-"""
-
-# Simple session cache to avoid recomputing embeddings repeatedly
-def _get_cache_dict(name: str) -> dict:
-    if name not in st.session_state:
-        st.session_state[name] = {}
-    return st.session_state[name]
-
-def get_cached_embedding(text: str) -> np.ndarray:
-    cache = _get_cache_dict("_embed_cache")
-    if text in cache:
-        return cache[text]
-    emb = embed_text(text)
-    cache[text] = emb
-    return emb
-
-def get_synonyms_for_key(key: str, llm_model: str) -> list[str]:
-    try:
-        resp = query_ollama(build_synonym_prompt(key), model=llm_model)
-        try:
-            parsed = extract_json_from_response(resp)
-        except Exception:
-            parsed = robust_json_from_text(resp)
-        syns = parsed.get("synonyms", [])
-        if isinstance(syns, list):
-            # Make sure they are strings, unique, and non-empty
-            syns = [str(s).strip() for s in syns if str(s).strip()]
-            # Cap at 8 (already prompted so, but just in case)
-            syns = syns[:8]
-            return syns
-    except Exception:
-        pass
-    return []
-
-def prioritize_paths_embedding(
+def prioritize_paths_lexical(
     allowed_paths: list[str],
     key: str,
-    llm_model: str,
+    value_preview: str,
+    sibling_keys: list[str],
+    definition: str,
     top_k: int = PER_KEY_CANDIDATE_LIMIT,
-    show_debug: bool = False
+    show_debug: bool = False,
 ) -> list[str]:
-    """
-    Rank allowed_paths semantically:
-      - get synonyms from LLM for the key
-      - embed [key + synonyms] (average embedding)
-      - embed each path
-      - cosine similarity, sort desc
-    """
-    synonyms = get_synonyms_for_key(key, llm_model)
-    queries = [key] + synonyms if synonyms else [key]
+    path_index = _get_path_index_for_definition(allowed_paths, definition)
+    q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
+    scored = []
+    for entry in path_index:
+        s = _lexical_score(q_tokens, q_bigrams, entry)
+        scored.append((entry["path"], s, entry["depth"]))
 
-    # Average embedding for the query bundle (key + synonyms)
-    q_vecs = [get_cached_embedding(q) for q in queries]
-    q_mean = np.mean(q_vecs, axis=0) if q_vecs else embed_text(key)
-
-    # Compute path embeddings once and score
-    scores = []
-    for p in allowed_paths:
-        p_vec = get_cached_embedding(p)
-        sim = cosine_similarity(q_mean, p_vec)
-        scores.append((p, sim))
-
-    scores.sort(key=lambda t: t[1], reverse=True)
-    top = scores[:top_k]
+    scored.sort(key=lambda t: (t[1], t[2], -len(t[0])), reverse=True)
+    top = scored[:top_k]
 
     if show_debug:
-        st.markdown(f"**{key} — top {len(top)} embedding candidates**")
-        for i, (p, sc) in enumerate(top, start=1):
-            st.write(f"{i:02d}. {p} — sim={sc:.3f}")
-        if synonyms:
-            st.caption(f"Synonyms used: {', '.join(synonyms)}")
+        st.markdown(f"**{key} — top {len(top)} lexical candidates**")
+        for i, (p, sc, depth) in enumerate(top, start=1):
+            st.write(f"{i:02d}. {p} — score={sc:.1f}, depth={depth}")
 
-    return [p for p, _ in top]
-
-# ==================================================
-# (OLD) Lexical indexing & ranking for NeXus paths
-# ==================================================
-# ⚠️ Retained for reference only — now DISABLED/UNUSED.
-# def _bigrams(tokens: list[str]) -> set[tuple[str, str]]:
-#     return {(tokens[i], tokens[i+1]) for i in range(len(tokens)-1)} if len(tokens) >= 2 else set()
-#
-# _GENERIC_LEAVES = {"name", "title", "value", "data", "type", "model"}  # mild penalty
-#
-# def _split_path_parts(path: str) -> list[str]:
-#     return [p for p in path.split("/") if p]
-#
-# def _build_path_doc_tokens(path: str) -> list[str]:
-#     parts = _split_path_parts(path)
-#     leaf = parts[-1].lower() if parts else ""
-#     toks = []
-#     for seg in parts:
-#         toks.extend(_tok(seg))
-#     if leaf:
-#         toks.extend(_tok(leaf))
-#     return toks
-#
-# def build_path_index(allowed_paths: list[str]) -> list[dict]:
-#     index = []
-#     for p in allowed_paths:
-#         if not p or len(p) >= 200:
-#             continue
-#         parts = _split_path_parts(p)
-#         leaf = parts[-1].lower() if parts else ""
-#         tokens = _build_path_doc_tokens(p)
-#         entry = {
-#             "path": p,
-#             "leaf": leaf,
-#             "tokens": tokens,
-#             "bigrams": _bigrams(tokens),
-#             "depth": len(parts),
-#         }
-#         index.append(entry)
-#     return index
-#
-# def _lexical_score(query_tokens: list[str], query_bigrams: set[tuple[str, str]], entry: dict) -> float:
-#     doc_tokens = entry["tokens"]
-#     doc_bigrams = entry["bigrams"]
-#     leaf = entry["leaf"]
-#     depth = entry["depth"]
-#     path_l = entry["path"].lower()
-#
-#     q_counts = Counter(query_tokens)
-#     d_counts = Counter(doc_tokens)
-#
-#     uni = 0
-#     for t, qc in q_counts.items():
-#         if t in d_counts:
-#             uni += min(qc, d_counts[t])
-#
-#     bi = len(query_bigrams & doc_bigrams)
-#
-#     sub_hits = 0
-#     for t in set(query_tokens):
-#         if len(t) >= 3:
-#             if t in leaf:
-#                 sub_hits += 1
-#             elif t in path_l:
-#                 sub_hits += 0.5
-#
-#     score = 3.0 * uni + 2.0 * bi + 1.0 * sub_hits + 0.25 * min(depth, 12)
-#     if (leaf in _GENERIC_LEAVES) and (leaf not in query_tokens):
-#         score -= 1.0
-#     return score
-#
-# def make_query_tokens(key: str, value_preview: str, sibling_keys: list[str]) -> tuple[list[str], set[tuple[str, str]]]:
-#     sib_snip = " ".join(sibling_keys[:6]) if sibling_keys else ""
-#     q_text = f"{key} {value_preview} {sib_snip}"
-#     q_tokens = _tok(q_text)
-#     q_bigrams = _bigrams(q_tokens)
-#     return q_tokens, q_bigrams
-#
-# def prioritize_paths_lexical(
-#     path_index: list[dict],
-#     key: str,
-#     value_preview: str,
-#     sibling_keys: list[str],
-#     top_k: int = PER_KEY_CANDIDATE_LIMIT
-# ) -> list[str]:
-#     q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
-#     scored = []
-#     for entry in path_index:
-#         s = _lexical_score(q_tokens, q_bigrams, entry)
-#         scored.append((entry["path"], s, entry["depth"]))
-#     scored.sort(key=lambda t: (t[1], t[2], -len(t[0])), reverse=True)
-#     return [p for p, _, _ in scored[:top_k]]
-#
-# def rank_paths_debug_for_key(
-#     key: str,
-#     path_index: list[dict],
-#     value_preview: str,
-#     sibling_keys: list[str],
-#     top_n: int = 10
-# ) -> list[tuple[str, float]]:
-#     q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
-#     scored = []
-#     for entry in path_index:
-#         s = _lexical_score(q_tokens, q_bigrams, entry)
-#         scored.append((entry["path"], s))
-#     scored.sort(key=lambda t: (t[1], -len(t[0])), reverse=True)
-#     top = scored[:top_n]
-#     st.markdown(f"**{key} — top {len(top)} candidates**")
-#     for i, (p, sc) in enumerate(top, start=1):
-#         st.write(f"{i:02d}. {p} — score={int(sc)}")
-#     return top
+    return [p for p, _, _ in top]
 
 # ==============================
-# Helpers for mapping (unchanged)
+# Helpers for mapping
 # ==============================
 def flatten_metadata_keys(data, parent=""):
     keys = []
@@ -411,6 +339,7 @@ def flatten_metadata_keys(data, parent=""):
     else:
         keys.append(parent)
     return list(dict.fromkeys(keys))
+
 
 def get_value_preview(data: dict, dotted_key: str, max_len: int = 240) -> str:
     try:
@@ -447,27 +376,74 @@ EXPERIMENT_TO_NX = {
     "MX": "NXmx",
     "APT": "NXapm",
     "Transport": "NXiv_temp",
-    "Other": "Other",  # keep a real NXDL as fallback
+    "Other": "Other",
 }
 
-BASE_DIR = Path(__file__).parent if '__file__' in globals() else Path.cwd()
-env_root = os.getenv("NEXUS_DEFINITIONS_ROOT", "").strip()
-DEF_ROOT = Path(env_root) if env_root else (BASE_DIR / "nexus_definitions")
-APP_DIRS = [DEF_ROOT / "applications", DEF_ROOT / "contributed_definitions"]
+# Optional explicit instrument→definition overrides
+INSTRUMENT_TO_NX_DEF = {
+    # "tescan amber x": "NXem",
+    # "nova nanosem 450": "NXem",
+}
+
+def normalize_instrument_name(name: str | None) -> str:
+    return (name or "").strip().lower()
+
+
+def pick_nexus_definition(instrument_name: str, experiment_type: str) -> str:
+    """
+    First use explicit instrument→definition overrides if present.
+    Otherwise fall back to experiment_type→EXPERIMENT_TO_NX.
+    """
+    inst_norm = normalize_instrument_name(instrument_name)
+    for inst_key, nx_def in INSTRUMENT_TO_NX_DEF.items():
+        if inst_key in inst_norm:
+            return nx_def
+    return EXPERIMENT_TO_NX.get(experiment_type, "NXem")
+
 
 def _strip_ns(tag: str) -> str:
-    return tag.split('}', 1)[-1] if '}' in tag else tag
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
 
 def find_definition_xml(definition: str) -> Path | None:
+    """
+    Find the best NXDL file for a given application definition.
+
+    Heuristics:
+    - Only consider stems that start with the requested definition, e.g. "nxem".
+    - Prefer an exact stem match ("nxem") over suffixed variants ("nxem_eels").
+    - Prefer files in 'applications/' over 'contributed_definitions/'.
+    - Among the rest, prefer shorter stems (more general).
+    """
     stem_lower = definition.lower()
+    best_path: Path | None = None
+    best_score = float("-inf")
+
     for folder in APP_DIRS:
         if not folder.exists():
             continue
         for p in folder.rglob("*.nxdl.xml"):
-            s = p.stem.lower()
-            if s == stem_lower or s.startswith(stem_lower):
-                return p
-    return None
+            stem = p.stem.lower()
+            if not stem.startswith(stem_lower):
+                continue
+
+            score = 0.0
+            if stem == stem_lower:
+                score += 100.0
+            score -= len(stem) * 0.1
+
+            parent_str = str(p.parent).lower()
+            if "applications" in parent_str:
+                score += 20.0
+            elif "contributed_definitions" in parent_str:
+                score += 0.0
+
+            if score > best_score:
+                best_score = score
+                best_path = p
+
+    return best_path
+
 
 def _group_label(g: ET.Element) -> str | None:
     t = g.get("type")
@@ -475,6 +451,7 @@ def _group_label(g: ET.Element) -> str | None:
         return t
     n = g.get("name")
     return n if n else None
+
 
 def _collect_paths_from_xml_group(g: ET.Element, parent: str = "") -> set[str]:
     paths: set[str] = set()
@@ -491,6 +468,7 @@ def _collect_paths_from_xml_group(g: ET.Element, parent: str = "") -> set[str]:
             if name and curr:
                 paths.add(f"{curr}/{name}")
     return paths
+
 
 def load_definition_schema_xml(definition: str, debug: bool = False) -> tuple[Path | None, set[str]]:
     xml_path = find_definition_xml(definition)
@@ -526,9 +504,166 @@ def load_definition_schema_xml(definition: str, debug: bool = False) -> tuple[Pa
     return xml_path, allowed
 
 # ==============================
+# Curated example mappings (per-instrument) + global example pairs
+# ==============================
+_EXAMPLE_MAPPING_CACHE: dict[str, dict[str, str]] = {}  # filepath -> {meta_key -> nx_path}
+_ALL_EXAMPLE_PAIRS_CACHE: dict[str, list[tuple[str, str]]] = {}  # definition -> [(meta_key, nx_path)]
+
+
+def normalize_instr_for_filename(name: str) -> str:
+    """Normalize instrument name to a safe filename fragment."""
+    s = (name or "").lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return s.strip("_")
+
+
+def _canonicalize_example_path(p: str) -> str:
+    """
+    Convert example paths like '/ENTRY/...' or 'ENTRY/...' into NXDL-style paths:
+      'NXentry/...'
+    and remove any leading slash.
+    """
+    if not isinstance(p, str):
+        return p
+
+    p = p.strip()
+
+    # Replace common variants of ENTRY with NXentry
+    if p.startswith("/ENTRY"):
+        p = "NXentry" + p[len("/ENTRY") :]
+    elif p.startswith("ENTRY"):
+        p = "NXentry" + p[len("ENTRY") :]
+    elif p.startswith("/NXentry"):
+        p = p[1:]  # drop leading slash
+
+    if p.startswith("/"):
+        p = p[1:]
+
+    return p
+
+
+def mapping_path_for(definition: str, instrument_name: str) -> Path:
+    """
+    Build the expected JSON path for a given (definition, instrument).
+    Example: NXem + 'Nova NanoSEM 450'
+    -> example_mappings/NXem__nova_nanosem_450.json
+    """
+    instr_norm = normalize_instr_for_filename(instrument_name)
+    fname = f"{definition}__{instr_norm}.json"
+    return EXAMPLE_MAPPINGS_DIR / fname
+
+
+def _load_single_example_mapping(path: Path) -> dict[str, str] | None:
+    """
+    Load one example mapping file and convert to {meta_key -> nx_path}.
+    """
+    global _EXAMPLE_MAPPING_CACHE
+
+    key = str(path)
+    if key in _EXAMPLE_MAPPING_CACHE:
+        return _EXAMPLE_MAPPING_CACHE[key]
+
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return None
+
+    if not isinstance(raw, dict):
+        return None
+
+    mapping: dict[str, str] = {}
+    for meta_key, info in raw.items():
+        if isinstance(info, dict) and "nx_path" in info:
+            nx_path = _canonicalize_example_path(str(info["nx_path"]))
+            mapping[str(meta_key)] = nx_path
+
+    if not mapping:
+        return None
+
+    _EXAMPLE_MAPPING_CACHE[key] = mapping
+    return mapping
+
+
+def get_example_mapping_for(instrument_name: str, definition: str) -> dict[str, str] | None:
+    """
+    Instrument-specific curated mapping: (definition, instrument) → {key -> nx_path}
+    """
+    if not instrument_name:
+        return None
+
+    path = mapping_path_for(definition, instrument_name)
+    return _load_single_example_mapping(path)
+
+
+def _load_all_example_pairs(definition: str) -> list[tuple[str, str]]:
+    """
+    Build a global list of (meta_key, nx_path) pairs for one definition
+    by reading ALL example JSON files for that definition (NXem__*.json).
+    """
+    global _ALL_EXAMPLE_PAIRS_CACHE
+    if definition in _ALL_EXAMPLE_PAIRS_CACHE:
+        return _ALL_EXAMPLE_PAIRS_CACHE[definition]
+
+    pairs: list[tuple[str, str]] = []
+
+    if EXAMPLE_MAPPINGS_DIR.exists():
+        pattern = f"{definition}__*.json"
+        for p in EXAMPLE_MAPPINGS_DIR.glob(pattern):
+            m = _load_single_example_mapping(p)
+            if not m:
+                continue
+            for k, nx_path in m.items():
+                pairs.append((k, nx_path))
+
+    _ALL_EXAMPLE_PAIRS_CACHE[definition] = pairs
+    return pairs
+
+
+def _key_similarity_score(q_key: str, ex_key: str) -> float:
+    """
+    Simple lexical similarity between two metadata keys.
+    """
+    q_tokens = set(_tok(q_key))
+    e_tokens = set(_tok(ex_key))
+    if not q_tokens or not e_tokens:
+        return 0.0
+
+    overlap = len(q_tokens & e_tokens)
+    substring = 1.0 if (ex_key.lower() in q_key.lower() or q_key.lower() in ex_key.lower()) else 0.0
+    return 2.0 * overlap + substring
+
+
+def get_example_pairs_for_key(definition: str, key: str, top_n: int = 6) -> list[tuple[str, str]]:
+    """
+    For a given key, return the top-N most similar example key→path pairs
+    from all known instruments for this definition.
+    """
+    all_pairs = _load_all_example_pairs(definition)
+    if not all_pairs:
+        return []
+
+    scored = []
+    for ex_key, nx_path in all_pairs:
+        s = _key_similarity_score(key, ex_key)
+        if s > 0:
+            scored.append((ex_key, nx_path, s))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda t: t[2], reverse=True)
+    top = scored[:top_n]
+    return [(k, p) for (k, p, _) in top]
+
+# ==============================
 # Mapping DB (instrument + definition)
 # ==============================
-MAPPING_DB_PATH = (BASE_DIR / "mapping_db.json")
+MAPPING_DB_PATH = BASE_DIR / "mapping_db.json"
+
 
 def _mapping_db_load() -> dict:
     try:
@@ -539,6 +674,7 @@ def _mapping_db_load() -> dict:
         pass
     return {}
 
+
 def _mapping_db_save(db: dict) -> None:
     try:
         with open(MAPPING_DB_PATH, "w", encoding="utf-8") as f:
@@ -546,14 +682,17 @@ def _mapping_db_save(db: dict) -> None:
     except Exception as e:
         st.warning(f"Could not save mapping DB: {e}")
 
+
 def _db_key(instrument: str, definition: str) -> str:
     inst = (instrument or "unknown").strip()[:120]
-    dfn  = (definition or "NXem").strip()[:80]
+    dfn = (definition or "NXem").strip()[:80]
     return f"{inst} | {dfn}"
+
 
 def _mapping_db_get(instrument: str, definition: str) -> dict | None:
     db = _mapping_db_load()
     return db.get(_db_key(instrument, definition))
+
 
 def _mapping_db_put(instrument: str, definition: str, mapping: dict) -> None:
     db = _mapping_db_load()
@@ -561,7 +700,7 @@ def _mapping_db_put(instrument: str, definition: str, mapping: dict) -> None:
         "mapping": mapping or {},
         "definition": definition,
         "instrument": instrument,
-        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _mapping_db_save(db)
 
@@ -569,8 +708,10 @@ def _mapping_db_put(instrument: str, definition: str, mapping: dict) -> None:
 # Small normalization helper
 # ==============================
 def _normalize_path(p: str) -> str:
-    """Drop a single leading slash if the model returns '/NXentry/...' instead of 'NXentry/...'. """
-    return p[1:] if isinstance(p, str) and p.startswith("/") else p
+    """Drop a leading slash if the model returns '/ENTRY/...' instead of 'ENTRY/...'. """
+    if not isinstance(p, str):
+        return p
+    return p[1:] if p.startswith("/") else p
 
 # ==============================
 # App UI
@@ -579,14 +720,20 @@ load_dotenv()
 LOGO_NFFA = "https://raw.githubusercontent.com/elahehsaadat/fair-nexus-gui/main/assets/nffa.png"
 LOGO_LADE = "https://raw.githubusercontent.com/elahehsaadat/fair-nexus-gui/main/assets/area.png"
 
-st.set_page_config(page_title="FAIR NeXus File Metadata Assistant — Step 1 + Mapping (beta)", layout="centered")
+st.set_page_config(
+    page_title="FAIR NeXus File Metadata Assistant — Step 1 + Mapping (beta)",
+    layout="centered",
+)
 
 with st.sidebar:
     st.image(LOGO_NFFA, caption="NFFA-DI")
     st.image(LOGO_LADE, caption="AREA Science Park")
 
 st.title("🔬 FAIR NeXus Assistant — Step 1 + Mapping (beta)")
-st.caption("Upload → preview → extract metadata → instrument/experiment via LLM → select NXDL → map keys to NX paths (cached).")
+st.caption(
+    "Upload → preview → extract metadata → instrument/experiment via LLM → select NXDL → "
+    "map keys to NeXus paths (curated examples + lexical ranking + LLM)."
+)
 
 # LLM model selection
 models = get_ollama_models()
@@ -603,7 +750,9 @@ if "meta" not in st.session_state:
 
 st.subheader("📄 Basic metadata")
 for k in list(st.session_state.meta.keys()):
-    st.session_state.meta[k] = st.text_input(k.replace("_", " ").title(), st.session_state.meta[k], key=f"meta_{k}")
+    st.session_state.meta[k] = st.text_input(
+        k.replace("_", " ").title(), st.session_state.meta[k], key=f"meta_{k}"
+    )
 
 meta = st.session_state.meta
 
@@ -611,8 +760,12 @@ meta = st.session_state.meta
 # Workflow: Upload image + metadata
 # ==============================
 if workflow == "Upload image + metadata":
-    file = st.file_uploader("Upload microscopy image", type=["tif", "tiff", "png", "jpg", "jpeg"], key="file_uploader")
-    header = st.file_uploader("(Optional) Upload separate metadata (JSON)", type="json", key="json_uploader")
+    file = st.file_uploader(
+        "Upload microscopy image", type=["tif", "tiff", "png", "jpg", "jpeg"], key="file_uploader"
+    )
+    header = st.file_uploader(
+        "(Optional) Upload separate metadata (JSON)", type="json", key="json_uploader"
+    )
 
     if file is None:
         st.info("👆 Upload an image to get started.")
@@ -666,9 +819,13 @@ if workflow == "Upload image + metadata":
                 "raw_experiment": None,
                 "experiment_type": "Other",
             }
+
             # Instrument
             try:
-                raw_inst = query_ollama(build_instrument_detection_prompt(pretty_metadata), model=selected_model)
+                raw_inst = query_ollama(
+                    build_instrument_detection_prompt(pretty_metadata),
+                    model=selected_model,
+                )
                 results["raw_instrument"] = raw_inst
                 try:
                     parsed_inst = extract_json_from_response(raw_inst)
@@ -693,8 +850,11 @@ if workflow == "Upload image + metadata":
             except Exception as e:
                 st.error(f"❌ Failed to classify experiment type: {e}")
 
-            # Pick NX app and load NXDL allowed paths
-            definition = EXPERIMENT_TO_NX.get(results["experiment_type"], "NXem")
+            # Pick NX app using instrument overrides if any, else experiment type
+            definition = pick_nexus_definition(
+                instrument_name=results["instrument_name"],
+                experiment_type=results["experiment_type"],
+            )
             xml_path, allowed_paths = load_definition_schema_xml(definition)
 
             st.session_state.step1_results = results
@@ -725,10 +885,10 @@ if workflow == "Upload image + metadata":
             aps = st.session_state.get("allowed_paths", [])
             st.write(f"**Allowed ontology paths:** {len(aps)} found")
             if aps:
-                st.code("\n".join(aps[:60]), language="text")  # sample preview only
+                st.code("\n".join(aps[:60]), language="text")
 
         # ==============================
-        # 🧭 Map keys → NeXus paths  (DB cache + EMBEDDING RANKING)
+        # Map keys → NeXus paths
         # ==============================
         st.subheader("🧭 Map metadata keys to NeXus paths")
 
@@ -741,35 +901,56 @@ if workflow == "Upload image + metadata":
         if not aps:
             st.info("No allowed paths found for the selected definition — cannot map.")
         else:
-            # Try cache first
-            cached = _mapping_db_get(instrument_name, definition)
-            if cached and isinstance(cached.get("mapping"), dict):
-                cached_map = cached["mapping"]
-                # validate against current allowed paths
-                valid_cached = {k: v for k, v in cached_map.items() if v in aps}
-                invalid_cached = {k: v for k, v in cached_map.items() if v not in aps}
+            # ----------------------------------
+            # 1) Try curated example mapping first (instrument-specific)
+            # ----------------------------------
+            curated = get_example_mapping_for(instrument_name, definition)
 
-                st.success(f"Loaded mapping from local DB (mapping_db.json) for **{instrument_name} | {definition}**")
-                st.caption(f"Updated at: {cached.get('updated_at', '—')}")
-                st.subheader("✅ Mapping (from DB)")
-                st.json(valid_cached or {})
+            if curated:
+                st.success(
+                    f"Loaded curated example mapping for **{instrument_name} | {definition}** "
+                    f"from JSON file `{mapping_path_for(definition, instrument_name).name}`"
+                )
+                st.subheader("📘 Curated mapping (from example JSON)")
+                st.json(curated)
 
-                if invalid_cached:
-                    st.subheader("⚠️ Cached entries not valid for this NXDL (ignored)")
-                    st.json(invalid_cached)
-
-                # set session
-                st.session_state.bulk_mapping_accepted = valid_cached
+                st.session_state.bulk_mapping_accepted = curated.copy()
                 st.session_state.bulk_mapping_rejected = {}
                 st.session_state.bulk_mapping_rawlog = {}
 
-                # Allow user to force a recompute
-                if not st.button("♻️ Re-map with LLM (ignore cache)"):
+                if not st.button("♻️ Extend mapping with LLM (only for missing keys)"):
                     st.stop()
                 else:
-                    st.info("Ignoring cache and re-mapping with LLM...")
+                    st.info("Extending curated mapping with LLM for keys not covered in the example...")
 
-            # No cache or user chose to recompute
+            else:
+                # ----------------------------------
+                # 2) If no curated mapping, try DB
+                # ----------------------------------
+                cached = _mapping_db_get(instrument_name, definition)
+                if cached and isinstance(cached.get("mapping"), dict):
+                    cached_map = cached["mapping"]
+                    valid_cached = cached_map
+
+                    st.success(
+                        f"Loaded mapping from local DB (mapping_db.json) for **{instrument_name} | {definition}**"
+                    )
+                    st.caption(f"Updated at: {cached.get('updated_at', '—')}")
+                    st.subheader("✅ Mapping (from DB)")
+                    st.json(valid_cached or {})
+
+                    st.session_state.bulk_mapping_accepted = valid_cached
+                    st.session_state.bulk_mapping_rejected = {}
+                    st.session_state.bulk_mapping_rawlog = {}
+
+                    if not st.button("♻️ Re-map with LLM (ignore cache)"):
+                        st.stop()
+                    else:
+                        st.info("Ignoring cache and re-mapping with LLM from scratch...")
+
+            # ----------------------------------
+            # 3) LLM-based mapping for remaining keys (with global examples)
+            # ----------------------------------
             meta_keys = flatten_metadata_keys(safe_md)
 
             st.caption("Choose how many keys to include (in order).")
@@ -777,7 +958,7 @@ if workflow == "Upload image + metadata":
                 "Number of keys to map",
                 min_value=1,
                 max_value=min(300, len(meta_keys)),
-                value=min(50, len(meta_keys))
+                value=min(50, len(meta_keys)),
             )
             keys_to_map = meta_keys[:max_keys]
 
@@ -787,27 +968,61 @@ if workflow == "Upload image + metadata":
             show_rank_debug = st.checkbox("Show candidate ranking (debug)", value=False)
             st.caption(f"Per-key candidate paths (fixed): {PER_KEY_CANDIDATE_LIMIT}")
 
-            if st.button("🤖 Map ALL selected keys"):
-                accepted = {}
-                rejected = {}
-                raw_log = {}
+            if st.button("🤖 Map ALL selected keys (LLM for missing ones)"):
+                accepted = dict(st.session_state.get("bulk_mapping_accepted", {}))
+                rejected = dict(st.session_state.get("bulk_mapping_rejected", {}))
+                raw_log = dict(st.session_state.get("bulk_mapping_rawlog", {}))
 
-                md_snippet = pretty_md if len(pretty_md) < 3000 else pretty_md[:3000] + "\n…(truncated)…"
+                md_snippet = (
+                    pretty_md if len(pretty_md) < 3000 else pretty_md[:3000] + "\n…(truncated)…"
+                )
 
                 progress = st.progress(0)
                 status = st.empty()
+                total_keys = len(keys_to_map)
 
                 for idx, key in enumerate(keys_to_map, start=1):
-                    status.write(f"Processing {idx}/{len(keys_to_map)}: **{key}**")
-                    value_preview = get_value_preview(safe_md, key)
+                    if key in accepted:
+                        progress.progress(idx / total_keys)
+                        continue
 
-                    # 🔵 Embedding-based candidate pool (TOP 50)
-                    allowed_subset = prioritize_paths_embedding(
+                    status.write(f"Processing {idx}/{total_keys}: **{key}**")
+                    value_preview = get_value_preview(safe_md, key)
+                    sibling_keys = [k for k in keys_to_map if k != key]
+
+                    # --- global example pairs (from all instruments for this definition)
+                    example_pairs = get_example_pairs_for_key(definition, key, top_n=6)
+                    
+                    # NEW: show which example mappings are being used for this key
+                    if show_rank_debug and example_pairs:
+                        st.markdown(f"**{key} — example mappings used**")
+                        lines = [f'"{ex_key}" → "{ex_path}"' for ex_key, ex_path in example_pairs]
+                        st.code("\n".join(lines), language="text")
+
+                    # 1) exact-key reuse: if an example key matches exactly, and its path is allowed, reuse it
+                    exact_match = None
+                    key_l = key.lower()
+                    for ex_key, ex_path in example_pairs:
+                        if ex_key.lower() == key_l:
+                            exact_match = ex_path
+                            break
+
+                    if exact_match is not None:
+                        if exact_match in aps:
+                            accepted[key] = exact_match
+                            progress.progress(idx / total_keys)
+                            continue
+                        # if not in aps, we still pass it as example but don't auto-accept
+
+                    # 2) build candidate list via lexical ranking
+                    allowed_subset = prioritize_paths_lexical(
                         allowed_paths=aps,
                         key=key,
-                        llm_model=selected_model,
+                        value_preview=value_preview,
+                        sibling_keys=sibling_keys,
+                        definition=definition,
                         top_k=PER_KEY_CANDIDATE_LIMIT,
-                        show_debug=show_rank_debug
+                        show_debug=show_rank_debug,
                     )
 
                     prompt = build_single_key_mapping_prompt(
@@ -816,13 +1031,13 @@ if workflow == "Upload image + metadata":
                         value_preview=value_preview,
                         allowed_subset=allowed_subset,
                         metadata_context_snippet=md_snippet,
+                        example_pairs=example_pairs,
                     )
 
                     try:
                         resp = query_ollama(prompt, model=selected_model)
                         raw_log[key] = resp
 
-                        # Parse JSON
                         try:
                             parsed = extract_json_from_response(resp)
                         except Exception:
@@ -835,31 +1050,27 @@ if workflow == "Upload image + metadata":
                                 if key in mapping_obj and isinstance(mapping_obj[key], str):
                                     proposed_path = mapping_obj[key]
                                 else:
-                                    # take the first string value if key not found exactly
                                     for _, v in mapping_obj.items():
                                         if isinstance(v, str):
                                             proposed_path = v
                                             break
 
-                        # Normalize a stray leading slash from the model
-                        proposed_path = _normalize_path(proposed_path)
+                        proposed_path = _normalize_path(_canonicalize_example_path(proposed_path))
 
-                        # Validate
                         if proposed_path and proposed_path in aps:
                             accepted[key] = proposed_path
                         else:
-                            rejected[key] = proposed_path  # "" or invalid path
+                            rejected[key] = proposed_path
 
                     except Exception as e:
                         raw_log[key] = f"ERROR: {e}"
                         rejected[key] = ""
 
-                    progress.progress(idx / len(keys_to_map))
+                    progress.progress(idx / total_keys)
 
                 status.empty()
 
-                # Show results
-                st.subheader("✅ Accepted (valid paths)")
+                st.subheader("✅ Accepted (valid / curated + examples + LLM)")
                 st.json(accepted or {})
 
                 st.subheader("⚠️ Rejected or empty (review needed)")
@@ -868,15 +1079,15 @@ if workflow == "Upload image + metadata":
                 with st.expander("LLM raw responses per key (debug)"):
                     st.code(json.dumps(raw_log, indent=2), language="json")
 
-                # Save to session
                 st.session_state.bulk_mapping_accepted = accepted
                 st.session_state.bulk_mapping_rejected = rejected
                 st.session_state.bulk_mapping_rawlog = raw_log
 
-                # Save to DB (only the accepted mapping)
                 if accepted:
                     _mapping_db_put(instrument_name, definition, accepted)
-                    st.success(f"Saved mapping to DB for **{instrument_name} | {definition}** → mapping_db.json")
+                    st.success(
+                        f"Saved mapping to DB for **{instrument_name} | {definition}** → mapping_db.json"
+                    )
 
 # ==============================
 # Other workflow placeholder

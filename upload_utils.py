@@ -106,39 +106,104 @@ def convert_to_preview(arr):
         return ((arr - np.min(arr)) / np.ptp(arr) * 255).astype(np.uint8)
     raise ValueError(f"Unsupported image shape: {arr.shape}")
 
+def get_jwt():
+    """
+    Get a JWT access token from the Orfeo auth server
+    using the password grant.
+    """
+    auth_url = os.getenv(
+        "ORFEO_AUTH_URL",
+        "https://orfeo-auth.areasciencepark.it/application/o/token/",
+    )
+
+    data = {
+        "grant_type": "password",
+        "client_id": os.getenv("ORFEO_CLIENT_ID", ""),
+        "username": os.getenv("ORFEO_USERNAME", ""),
+        "password": os.getenv("ORFEO_PASSWORD", ""),
+        "scope": "profile",
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    resp = requests.post(auth_url, data=data, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["access_token"]
 
 def get_ollama_models(host=None):
+    """
+    Now: fetch available models from the Orfeo vLLM gateway.
+    Keeps the same name for backwards compatibility.
+    """
     try:
-        host = host or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        res = requests.get(f"{host}/api/tags")
+        host = host or os.getenv(
+            "ORFEO_LLM_BASE_URL",
+            "https://orfeo-llm.areasciencepark.it/vllm",
+        )
+        jwt_token = get_jwt()
+
+        headers = {
+            "Authorization": f"Bearer {jwt_token}",
+            "Content-Type": "application/json",
+        }
+
+        # Orfeo exposes OpenAI-style /v1/models
+        res = requests.get(f"{host}/v1/models", headers=headers, timeout=20)
+
         if res.status_code == 200:
-            return [m["name"] for m in res.json().get("models", [])]
+            data = res.json()
+            # OpenAI-style: {"data": [{"id": "...", ...}, ...]}
+            return [m["id"] for m in data.get("data", [])]
     except Exception:
         pass
+
     return []
 
 def query_ollama(prompt, model, host=None):
+    """
+    Now: send a chat completion request to Orfeo vLLM.
+    Returns the assistant's reply as a plain string.
+    """
     try:
-        host = host or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        res = requests.post(
-            f"{host}/api/generate",
-            json={"model": model, "prompt": prompt},
-            stream=True
+        host = host or os.getenv(
+            "ORFEO_LLM_BASE_URL",
+            "https://orfeo-llm.areasciencepark.it/vllm",
         )
-        if res.status_code != 200:
-            return f'{{"error": "Status {res.status_code}: {res.text}"}}'
+        jwt_token = get_jwt()
 
-        output = ""
-        for line in res.iter_lines():
-            if line:
-                try:
-                    chunk = json.loads(line)
-                    output += chunk.get("response", "")
-                except Exception:
-                    pass
-        return output.strip()
+        headers = {
+            "Authorization": f"Bearer {jwt_token}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.7,
+            # "stream": True  # you *could* enable this if your gateway supports it
+        }
+
+        res = requests.post(
+            f"{host}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+
+        if res.status_code != 200:
+            return (
+                f'{{"error": "Status {res.status_code}: '
+                f'{res.text}"}}'
+            )
+
+        data = res.json()
+        # OpenAI-style: choices[0].message.content
+        return data["choices"][0]["message"]["content"].strip()
+
     except Exception as e:
-        return f'{{"error": "Ollama request failed: {str(e)}"}}'
+        return f'{{"error": "Orfeo LLM request failed: {str(e)}"}}'
 
 def extract_metadata_from_tiff(uploaded_file) -> dict:
 

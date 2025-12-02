@@ -1,0 +1,130 @@
+{
+  "ImageWidth(px)": {
+    "value": 1024,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/data/@shape_x",
+    "units": "px",
+    "notes": "TIFF ImageWidth"
+  },
+  "ImageHeight(px)": {
+    "value": 768,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/data/@shape_y",
+    "units": "px",
+    "notes": "TIFF ImageLength"
+  },
+  "BitsPerSample": {
+    "value": [
+      8
+    ],
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/bit_depth",
+    "units": "bits",
+    "notes": "Per-sample bit depth"
+  },
+  "SamplesPerPixel": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/color_channels",
+    "units": null,
+    "notes": "Number of channels; 1 for grayscale ColorMap-based image"
+  },
+  "PhotometricInterpretation": {
+    "value": 3,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/photometric_interpretation",
+    "units": null,
+    "notes": "TIFF photometric interpretation (likely palette or grayscale)"
+  },
+  "Compression": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/process[image_io]/parameter/compression",
+    "units": null,
+    "notes": "TIFF compression code"
+  },
+  "XResolution(density)": {
+    "value": 1.0,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/process[image_io]/parameter/x_resolution_density",
+    "units": "px per unit",
+    "notes": "Original TIFF XResolution"
+  },
+  "YResolution(density)": {
+    "value": 1.0,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/process[image_io]/parameter/y_resolution_density",
+    "units": "px per unit",
+    "notes": "Original TIFF YResolution"
+  },
+  "ResolutionUnit": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/process[image_io]/parameter/resolution_unit",
+    "units": null,
+    "notes": "1=none, 2=inches, 3=centimeter"
+  },
+  "EHT": {
+    "value": "15.00 kV",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/ebeam/accelerating_voltage",
+    "units": "kV",
+    "notes": "EHT (accelerating voltage) from Zeiss metadata"
+  },
+  "Beam Current": {
+    "value": "80.0 µA",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/ebeam/beam_current",
+    "units": "µA",
+    "notes": "Beam (probe) current; convert to A for storage"
+  },
+  "WD": {
+    "value": "4.840 mm",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/stage_lab/working_distance",
+    "units": "mm",
+    "notes": "Working distance; convert to meters if desired"
+  },
+  "Stage at Z": {
+    "value": "44.069 mm",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/stage_lab/position/z",
+    "units": "mm",
+    "notes": "Sample height / Z position; convert to meters"
+  },
+  "Stage Tilt": {
+    "value": "in X",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/stage_lab/tilt",
+    "units": null,
+    "notes": "Stage tilt description (e.g., 'in X')"
+  },
+  "Magnification": {
+    "value": "782.23 K X",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/imaging/magnification",
+    "units": null,
+    "notes": "If Zeiss provides numeric magnification under a key like 'Mag'"
+  },
+  "Mag Range": {
+    "value": "3",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/imaging/magnification_range",
+    "units": null,
+    "notes": "Zeiss magnification range index"
+  },
+  "Mag State": {
+    "value": "calibrated",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/imaging/magnification_state",
+    "units": null,
+    "notes": "e.g. 'calibrated'"
+  },
+  "Pixel Size": {
+    "value": "374.5 pm",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/pixel_size",
+    "units": "pm",
+    "notes": "Pixel size; convert to meters for internal storage"
+  },
+  "Signal A": {
+    "value": "InLens",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/detector_em[0]/type",
+    "units": null,
+    "notes": "Primary imaging signal (e.g., 'InLens')"
+  },
+  "Detector": {
+    "value": "InLens",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/detector_em[0]/name",
+    "units": null,
+    "notes": "Detector name (e.g., InLens, SE2)"
+  },
+  "BSD Mode": {
+    "value": "Topo",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/em_lab/detector_em[bse_detector]/mode",
+    "units": null,
+    "notes": "Backscattered electron detector mode if relevant"
+  }
+}

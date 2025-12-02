@@ -1,0 +1,185 @@
+{
+  "SystemType": {
+    "nx_path": "/ENTRY/instrument/em_lab/microscope_type",
+    "units": null,
+    "notes": "",
+    "value": "Nova NanoSEM 450"
+  },
+  "User": {
+    "nx_path": "/ENTRY/user[0]/name",
+    "units": null,
+    "notes": "",
+    "value": "supervisor"
+  },
+  "Date": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/start_time",
+    "units": "ISO 8601",
+    "notes": "",
+    "value": "10/22/2015"
+  },
+  "Time": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/start_time",
+    "units": "local time",
+    "notes": "Merge Date+Time to ISO 8601",
+    "value": "02:26:29 PM"
+  },
+  "Column": {
+    "nx_path": "/ENTRY/instrument/em_lab/electron_source/type",
+    "units": null,
+    "notes": "",
+    "value": "FEG"
+  },
+  "ESEM": {
+    "nx_path": "/ENTRY/instrument/em_lab/environmental_mode",
+    "units": null,
+    "notes": "",
+    "value": "yes"
+  },
+  "HV": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/ebeam/accelerating_voltage",
+    "units": "V",
+    "notes": "",
+    "value": "2000"
+  },
+  "WD": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/stage_lab/working_distance",
+    "units": "m",
+    "notes": "",
+    "value": "0.00580188"
+  },
+  "BeamCurrent": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/ebeam/beam_current",
+    "units": "A",
+    "notes": "",
+    "value": "3.2e-011"
+  },
+  "MagnificationMode": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/imaging/magnification_mode",
+    "units": null,
+    "notes": "",
+    "value": "4"
+  },
+  "HFW": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/field_of_view_x",
+    "units": "m",
+    "notes": "",
+    "value": "3.175e-006"
+  },
+  "VFW": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/field_of_view_y",
+    "units": "m",
+    "notes": "",
+    "value": "2.11667e-006"
+  },
+  "FrameTime": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/exposure_time",
+    "units": "s",
+    "notes": "",
+    "value": "71.356"
+  },
+  "Contrast": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[image_display]/parameter/contrast",
+    "units": null,
+    "notes": "",
+    "value": "54.7923"
+  },
+  "Brightness": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[image_display]/parameter/brightness",
+    "units": null,
+    "notes": "",
+    "value": "44.6"
+  },
+  "DigitalGamma": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[image_display]/parameter/gamma",
+    "units": null,
+    "notes": "",
+    "value": "1"
+  },
+  "PostProcessing": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[image_processing]/description",
+    "units": null,
+    "notes": "",
+    "value": "None"
+  },
+  "MagnificationCorrection": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[calibration]/parameter/magnification_correction",
+    "units": null,
+    "notes": "",
+    "value": "Off"
+  },
+  "ZoomFactor": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/zoom",
+    "units": null,
+    "notes": "",
+    "value": "1.0"
+  },
+  "StageX": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/stage_lab/position/x",
+    "units": "m",
+    "notes": "",
+    "value": "0.00982746"
+  },
+  "StageY": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/stage_lab/position/y",
+    "units": "m",
+    "notes": "",
+    "value": "0.0208764"
+  },
+  "StageZ": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/stage_lab/position/z",
+    "units": "m",
+    "notes": "",
+    "value": "0.00550033"
+  },
+  "StageR": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/stage_lab/rotation",
+    "units": "deg",
+    "notes": "",
+    "value": "2.79075"
+  },
+  "Gas": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/em_lab/environment/gas/type",
+    "units": null,
+    "notes": "",
+    "value": "Wet"
+  },
+  "ImageWidth(px)": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/data/@shape_x",
+    "units": "px",
+    "notes": "Derived from TIFF ImageWidth",
+    "value": 1536
+  },
+  "ImageHeight(px)": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/data/@shape_y",
+    "units": "px",
+    "notes": "Derived from TIFF ImageLength",
+    "value": 1103
+  },
+  "SamplesPerPixel": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/color_channels",
+    "units": null,
+    "notes": "From TIFF",
+    "value": 3
+  },
+  "ResolutionDPI": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/pixel_size",
+    "units": "m",
+    "notes": "Convert (dpi_x, dpi_y) to meters: pixel_size = 0.0254 / dpi",
+    "value": [
+      56.0,
+      56.0
+    ]
+  },
+  "PlanarConfiguration": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/data_layout",
+    "units": null,
+    "notes": "From TIFF 'chunky' (1) or 'planar' (2)",
+    "value": 1
+  },
+  "ResolutionUnit": {
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/pixel_size@unit_source",
+    "units": null,
+    "notes": "TIFF ResolutionUnit (2=inches, 3=cm) to help convert DPI",
+    "value": 2
+  }
+}

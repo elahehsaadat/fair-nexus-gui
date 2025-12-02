@@ -1,0 +1,94 @@
+{
+  "Vendor": {
+    "value": "TESCAN",
+    "nx_path": "/ENTRY/instrument/em_lab/manufacturer",
+    "units": null,
+    "notes": "Derived from TIFF Make."
+  },
+  "Make": {
+    "value": "TESCAN - http://www.tescan.com/",
+    "nx_path": "/ENTRY/instrument/em_lab/manufacturer_url",
+    "units": null,
+    "notes": "Full TIFF Make string including URL."
+  },
+  "Model": {
+    "value": "TESCAN AMBER X TESCAN AMBER X",
+    "nx_path": "/ENTRY/instrument/em_lab/name",
+    "units": null,
+    "notes": "Instrument model as reported by the vendor."
+  },
+  "Instrument": {
+    "value": "TESCAN AMBER X",
+    "nx_path": "/ENTRY/instrument/name",
+    "units": null,
+    "notes": "Normalized instrument name derived from Model."
+  },
+  "Software": {
+    "value": "TESCAN Essence Version 1.3.1.0, build 7450",
+    "nx_path": "/ENTRY/instrument/em_lab/software/acquisition/name",
+    "units": null,
+    "notes": "Acquisition software name + version string."
+  },
+  "User": {
+    "value": "supervisor",
+    "nx_path": "/ENTRY/user[0]/name",
+    "units": null,
+    "notes": "From TIFF Artist tag."
+  },
+  "AcquisitionDateTime": {
+    "value": "2024:11:14 09:37:40",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/start_time",
+    "units": "ISO 8601",
+    "notes": "Convert from 'YYYY:MM:DD HH:MM:SS' to ISO8601 with timezone before writing."
+  },
+  "ImageWidth(px)": {
+    "value": 1024,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/data/@shape_x",
+    "units": "px",
+    "notes": "TIFF ImageWidth; dataset shape in HDF5."
+  },
+  "ImageHeight(px)": {
+    "value": 1104,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/data/@shape_y",
+    "units": "px",
+    "notes": "TIFF ImageLength; dataset shape in HDF5."
+  },
+  "BitsPerSample": {
+    "value": [
+      16
+    ],
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/bit_depth",
+    "units": "bits",
+    "notes": "Per-sample bit depth."
+  },
+  "SamplesPerPixel": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/color_channels",
+    "units": null,
+    "notes": "Number of channels; 1 for grayscale."
+  },
+  "PhotometricInterpretation": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/photometric_interpretation",
+    "units": null,
+    "notes": "1 = BlackIsZero (grayscale)."
+  },
+  "Compression": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/process[image_io]/parameter/compression",
+    "units": null,
+    "notes": "TIFF compression code; 1 = Uncompressed."
+  },
+  "PlanarConfiguration": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[0]/image_set/image_em[0]/data_layout",
+    "units": null,
+    "notes": "1 = chunky format."
+  },
+  "RawVendorMetadataTag50431": {
+    "value": "<8940 bytes binary>",
+    "nx_path": "/ENTRY/instrument/em_lab/vendor_metadata",
+    "units": "bytes",
+    "notes": "Private TIFF tag 50431 containing TESCAN binary metadata; store raw bytes in a side dataset or NXnote."
+  }
+}

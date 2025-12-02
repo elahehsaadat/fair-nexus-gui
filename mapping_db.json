@@ -1,0 +1,22 @@
+{
+  "TESCAN AMBER X | NXem": {
+    "mapping": {
+      "Compression": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXprocess/NXnote/algorithm",
+      "Make": "NXentry/NXobject/NXinstrument_em/NXebeam_column/NXcomponent/NXfabrication/vendor",
+      "Model": "NXentry/NXobject/NXinstrument_em/NXfabrication/model",
+      "StripOffsets": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXdata/imag",
+      "Orientation": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXprocess/NXnote/context",
+      "SamplesPerPixel": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXdata/intensity",
+      "RowsPerStrip": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXdata/axis_i",
+      "StripByteCounts": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXdata/imag",
+      "PlanarConfiguration": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXprocess/NXnote/context",
+      "Software": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXprocess/NXnote",
+      "DateTime": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXprocess/NXnote/context",
+      "Artist": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXprocess/NXnote/context",
+      "50431": "NXentry/NXobject/NXobject/NXevent_data_em/NXimage/NXdata/intensity"
+    },
+    "definition": "NXem",
+    "instrument": "TESCAN AMBER X",
+    "updated_at": "2025-12-02T16:25:36.365144+00:00"
+  }
+}

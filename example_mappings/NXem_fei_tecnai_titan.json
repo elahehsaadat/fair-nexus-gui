@@ -1,0 +1,76 @@
+{
+  "ImageWidth(px)": {
+    "value": 1376,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/data/@shape_x",
+    "units": "px",
+    "notes": "TIFF ImageWidth; dataset shape when writing data."
+  },
+  "ImageHeight(px)": {
+    "value": 1070,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/data/@shape_y",
+    "units": "px",
+    "notes": "TIFF ImageLength; dataset shape when writing data."
+  },
+  "Mode": {
+    "value": "L",
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/data_dtype",
+    "units": null,
+    "notes": "PIL mode; translate to dataset dtype (e.g., L→uint8)."
+  },
+  "BitsPerSample": {
+    "value": [
+      8
+    ],
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/bit_depth",
+    "units": "bits",
+    "notes": "Per-sample bit depth from TIFF."
+  },
+  "SamplesPerPixel": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/color_channels",
+    "units": null,
+    "notes": "Use TIFF SamplesPerPixel when present; otherwise infer from mode."
+  },
+  "PhotometricInterpretation": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/photometric_interpretation",
+    "units": null,
+    "notes": "1=BlackIsZero, 2=RGB, etc."
+  },
+  "Compression": {
+    "value": 1,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[image_io]/parameter/compression",
+    "units": null,
+    "notes": "TIFF compression code; keep in NXprocess for I/O provenance."
+  },
+  "XResolution(density)": {
+    "value": 10.0,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[image_io]/parameter/x_resolution_density",
+    "units": "px per unit",
+    "notes": "Original TIFF x density; do not store directly as pixel size."
+  },
+  "YResolution(density)": {
+    "value": 10.0,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[image_io]/parameter/y_resolution_density",
+    "units": "px per unit",
+    "notes": "Original TIFF y density; do not store directly as pixel size."
+  },
+  "ResolutionUnit": {
+    "value": 3,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/process[image_io]/parameter/resolution_unit",
+    "units": null,
+    "notes": "2=inches, 3=centimeter. Used to derive pixel_size_* in meters."
+  },
+  "PixelSizeX(m)": {
+    "value": 0.001,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/pixel_size_x",
+    "units": "m",
+    "notes": "Derived from TIFF resolution & unit."
+  },
+  "PixelSizeY(m)": {
+    "value": 0.001,
+    "nx_path": "/ENTRY/event_data_em_set/event_data_em[<i>]/image_set/image_em[<j>]/pixel_size_y",
+    "units": "m",
+    "notes": "Derived from TIFF resolution & unit."
+  }
+}
