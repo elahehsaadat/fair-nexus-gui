@@ -2,16 +2,111 @@
 
 import requests
 from tifffile import TiffFile
+import tifffile  # <-- needed for tifffile.imread used below
 import numpy as np
 from io import BytesIO
 import re
 from PIL import Image
 import os
 import json
-import re
 import paramiko
 import string
 from urllib.parse import urlparse
+
+# =========================
+# Helpers: parse vendor blobs (bytes/text) into key=value dict
+# =========================
+_PRINTABLE_KEEP = set(string.printable) | {"\n", "\r", "\t"}
+
+def _decode_bytes_best_effort(b: bytes) -> str:
+    # Try UTF-8 first, then latin1 as a fallback (never throws)
+    try:
+        return b.decode("utf-8", errors="ignore")
+    except Exception:
+        return b.decode("latin-1", errors="ignore")
+
+def _clean_text_for_kv(s: str) -> str:
+    # Keep printable chars + whitespace; strip NULs
+    s = s.replace("\x00", "\n")
+    s = "".join(ch for ch in s if (ch in _PRINTABLE_KEEP))
+    # Normalize line endings a bit
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return s
+
+_KV_RE = re.compile(r"(?m)^\s*([A-Za-z][A-Za-z0-9_\-]*)\s*=\s*(.*)\s*$")
+
+def _coerce_value(v: str):
+    v = v.strip()
+    if v == "":
+        return ""
+    # bool-ish
+    vl = v.lower()
+    if vl in ("true", "false"):
+        return vl == "true"
+    # int
+    try:
+        if re.fullmatch(r"[+-]?\d+", v):
+            return int(v)
+    except Exception:
+        pass
+    # float (including scientific)
+    try:
+        if re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?", v):
+            return float(v)
+    except Exception:
+        pass
+    return v
+
+def _merge_kv(dest: dict, src: dict) -> None:
+    """
+    Merge src into dest. If a key repeats with different values, store list of unique values.
+    """
+    for k, v in src.items():
+        if k not in dest:
+            dest[k] = v
+        else:
+            if dest[k] == v:
+                continue
+            # convert to list (unique)
+            if not isinstance(dest[k], list):
+                dest[k] = [dest[k]]
+            if v not in dest[k]:
+                dest[k].append(v)
+
+def _parse_kv_from_text(text: str) -> dict:
+    """
+    Parse lines like `Key=Value` into a dict.
+    Only parses if it finds enough key=value lines to be meaningful.
+    """
+    if not isinstance(text, str) or "=" not in text:
+        return {}
+
+    cleaned = _clean_text_for_kv(text)
+    matches = list(_KV_RE.finditer(cleaned))
+    if len(matches) < 3:
+        return {}
+
+    out = {}
+    for m in matches:
+        k = m.group(1).strip()
+        v = m.group(2).strip()
+        out[k] = _coerce_value(v)
+    return out
+
+def _parse_kv_from_bytes(blob: bytes) -> dict:
+    if not isinstance(blob, (bytes, bytearray)) or len(blob) == 0:
+        return {}
+    txt = _decode_bytes_best_effort(bytes(blob))
+    return _parse_kv_from_text(txt)
+
+def _summarize_bytes(blob: bytes, max_preview: int = 200) -> str:
+    txt = _clean_text_for_kv(_decode_bytes_best_effort(blob))
+    txt = re.sub(r"\s+", " ", txt).strip()
+    if not txt:
+        return f"<bytes length={len(blob)}>"
+    if len(txt) > max_preview:
+        txt = txt[:max_preview] + "…"
+    return f"<bytes length={len(blob)} preview='{txt}'>"
 
 # === File transfer ===
 def send_file_sftp(local_path, remote_uri):
@@ -25,16 +120,14 @@ def send_file_sftp(local_path, remote_uri):
     print(f"📤 File uploaded to {remote_uri}")
 
 def send_file_http(local_path, url):
-    with open(local_path, 'rb') as f:
-        res = requests.post(url, files={'file': f})
+    with open(local_path, "rb") as f:
+        res = requests.post(url, files={"file": f})
     print(f"📤 Uploaded to {url}, status code: {res.status_code}")
-
 
 # === Utilities ===
 def fix_common_json_errors(json_str: str) -> str:
-    # Add commas between properties if missing
-    json_str = re.sub(r'("\s*:\s*[^,{}\[\]\n"]+)(\s*")', r'\1,\2', json_str)
-    json_str = re.sub(r'(\})(\s*\{)', r'\1,\2', json_str)
+    json_str = re.sub(r'("\s*:\s*[^,{}\[\]\n"]+)(\s*")', r"\1,\2", json_str)
+    json_str = re.sub(r"(\})(\s*\{)", r"\1,\2", json_str)
     json_str = re.sub(r'(?<=\{|,)\s*(\w+)\s*:', r'"\1":', json_str)
     return json_str
 
@@ -46,29 +139,26 @@ def extract_json_from_response(text) -> dict:
         raise ValueError(f"Expected string or dict, got {type(text)}")
 
     try:
-        # 1. Remove markdown code fences if present
         text = re.sub(r"^```json\s*|```$", "", text, flags=re.IGNORECASE).strip()
+        text = "".join(ch for ch in text if ch in string.printable)
 
-        # 2. Clean non-printable characters (likely binary garbage)
-        text = ''.join(ch for ch in text if ch in string.printable)
-
-        # 3. Use brace matching to extract the first valid JSON block
         brace_count = 0
         json_start = None
+        json_candidate = None
         for i, ch in enumerate(text):
-            if ch == '{':
+            if ch == "{":
                 if json_start is None:
                     json_start = i
                 brace_count += 1
-            elif ch == '}':
+            elif ch == "}":
                 brace_count -= 1
                 if brace_count == 0 and json_start is not None:
-                    json_candidate = text[json_start:i+1]
+                    json_candidate = text[json_start : i + 1]
                     break
-        else:
+
+        if not json_candidate:
             raise ValueError("No complete JSON object found in response.")
 
-        # 4. Attempt to parse
         return json.loads(json_candidate)
 
     except json.JSONDecodeError as e:
@@ -107,10 +197,6 @@ def convert_to_preview(arr):
     raise ValueError(f"Unsupported image shape: {arr.shape}")
 
 def get_jwt():
-    """
-    Get a JWT access token from the Orfeo auth server
-    using the password grant.
-    """
     auth_url = os.getenv(
         "ORFEO_AUTH_URL",
         "https://orfeo-auth.areasciencepark.it/application/o/token/",
@@ -130,10 +216,6 @@ def get_jwt():
     return resp.json()["access_token"]
 
 def get_ollama_models(host=None):
-    """
-    Now: fetch available models from the Orfeo vLLM gateway.
-    Keeps the same name for backwards compatibility.
-    """
     try:
         host = host or os.getenv(
             "ORFEO_LLM_BASE_URL",
@@ -146,12 +228,10 @@ def get_ollama_models(host=None):
             "Content-Type": "application/json",
         }
 
-        # Orfeo exposes OpenAI-style /v1/models
         res = requests.get(f"{host}/v1/models", headers=headers, timeout=20)
 
         if res.status_code == 200:
             data = res.json()
-            # OpenAI-style: {"data": [{"id": "...", ...}, ...]}
             return [m["id"] for m in data.get("data", [])]
     except Exception:
         pass
@@ -159,10 +239,6 @@ def get_ollama_models(host=None):
     return []
 
 def query_ollama(prompt, model, host=None):
-    """
-    Now: send a chat completion request to Orfeo vLLM.
-    Returns the assistant's reply as a plain string.
-    """
     try:
         host = host or os.getenv(
             "ORFEO_LLM_BASE_URL",
@@ -182,7 +258,6 @@ def query_ollama(prompt, model, host=None):
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.7,
-            # "stream": True  # you *could* enable this if your gateway supports it
         }
 
         res = requests.post(
@@ -193,30 +268,72 @@ def query_ollama(prompt, model, host=None):
         )
 
         if res.status_code != 200:
-            return (
-                f'{{"error": "Status {res.status_code}: '
-                f'{res.text}"}}'
-            )
+            return f'{{"error": "Status {res.status_code}: {res.text}"}}'
 
         data = res.json()
-        # OpenAI-style: choices[0].message.content
         return data["choices"][0]["message"]["content"].strip()
 
     except Exception as e:
         return f'{{"error": "Orfeo LLM request failed: {str(e)}"}}'
 
 def extract_metadata_from_tiff(uploaded_file) -> dict:
+    """
+    Improved TIFF metadata extraction:
+    - Reads standard TIFF tags (ImageWidth, Make, Model, Software, etc.)
+    - Detects vendor/private tags that contain binary/text blobs
+    - Parses key=value pairs from those blobs into meta["VendorKV"]
+      (e.g. HV, SpotSize, WD, StageX, Detector0Gain, ...)
+    - Avoids dumping huge byte strings into JSON (stores a short summary instead)
+    """
+    uploaded_file.seek(0)  # REWIND — critical!
+    meta: dict = {}
+    vendor_kv: dict = {}
+    vendor_sources: list = []
 
-    uploaded_file.seek(0)                 # REWIND — critical!
-    meta = {}
+    raw = uploaded_file.read()
+    with TiffFile(BytesIO(raw)) as tif:
+        # Most metadata is in page 0 tags; some vendors repeat in other pages.
+        pages = list(tif.pages[: min(3, len(tif.pages))])  # check first few pages
+        for page_i, page in enumerate(pages):
+            for tag in page.tags.values():
+                try:
+                    name = str(tag.name)
+                    value = tag.value
+                except Exception:
+                    continue
 
-    with TiffFile(BytesIO(uploaded_file.read())) as tif:
-        tags = tif.pages[0].tags
-        for tag in tags.values():
-            try:
-                meta[tag.name] = tag.value
-            except Exception:
-                continue
+                # Keep first occurrence for standard tags; later pages shouldn't overwrite unless empty
+                if name not in meta or meta.get(name) in (None, "", "<empty>"):
+                    # Handle bytes blobs: summarize + parse KV
+                    if isinstance(value, (bytes, bytearray)):
+                        blob = bytes(value)
+                        meta[name] = _summarize_bytes(blob)
+
+                        kv = _parse_kv_from_bytes(blob)
+                        if kv:
+                            _merge_kv(vendor_kv, kv)
+                            vendor_sources.append(
+                                {"tag": name, "page": page_i, "kind": "bytes", "kv_count": len(kv)}
+                            )
+
+                    # Handle text blobs that look like KV blocks (some vendors use ImageDescription etc.)
+                    elif isinstance(value, str):
+                        meta[name] = value
+                        kv = _parse_kv_from_text(value)
+                        if kv:
+                            _merge_kv(vendor_kv, kv)
+                            vendor_sources.append(
+                                {"tag": name, "page": page_i, "kind": "text", "kv_count": len(kv)}
+                            )
+
+                    else:
+                        # Normal scalar/list types
+                        meta[name] = value
+
+    if vendor_kv:
+        meta["VendorKV"] = vendor_kv
+        meta["VendorKV_sources"] = vendor_sources
+
     return meta
 
 def extract_metadata_from_json_header(file) -> dict:

@@ -1,12 +1,15 @@
+# nexus_gui.py
 import streamlit as st
 import json
 import os
 import re
+import math
 from pathlib import Path
 from dotenv import load_dotenv
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from collections import Counter
+from dataclasses import dataclass
 
 from upload_utils import (
     get_ollama_models,
@@ -22,16 +25,136 @@ from upload_utils import (
 # =========================================
 # Constants
 # =========================================
-PER_KEY_CANDIDATE_LIMIT = 50  # fixed; not shown in the UI
+PER_KEY_CANDIDATE_LIMIT = 50
 _WORD_RE = re.compile(r"[a-z0-9_]+")
+
+# Deterministic / Hybrid thresholds
+CONF_MIN = 0.78
+LOGRATIO_MIN = 0.55
 
 BASE_DIR = Path(__file__).parent if "__file__" in globals() else Path.cwd()
 env_root = os.getenv("NEXUS_DEFINITIONS_ROOT", "").strip()
 DEF_ROOT = Path(env_root) if env_root else (BASE_DIR / "nexus_definitions")
 APP_DIRS = [DEF_ROOT / "applications", DEF_ROOT / "contributed_definitions"]
 
-# Folder where you put curated example mappings (per-instrument)
 EXAMPLE_MAPPINGS_DIR = BASE_DIR / "example_mappings"
+
+# -----------------------------------------
+# (A) General fallback “stash” for unmapped metadata
+# -----------------------------------------
+# These are typical TIFF/EXIF-ish file/encoding keys that should NOT be forced into
+# instrument fabrication/model/vendor fields (a common failure mode in purely lexical matching).
+ENCODING_KEYS = {
+    "bitspersample",
+    "compression",
+    "photometricinterpretation",
+    "stripbytecounts",
+    "stripoffsets",
+    "orientation",
+    "rowspersstrip",
+    "samplesperpixel",
+    "planarconfiguration",
+    "software",
+}
+
+# If one of these “encoding” keys maps outside these safe zones, we stash instead.
+SAFE_ZONES_FOR_ENCODING = (
+    "nximage",
+    "nxdata",
+    "nxprocess",
+    "nxnote",
+    "nxcollection",
+    "nxentry",  # allow start_time etc
+)
+
+
+def _find_best_stash_field(allowed_paths: list[str]) -> str:
+    """
+    Find a *schema-valid* field path (must exist in allowed_paths) where we can store
+    a JSON blob of unmapped metadata, without inventing new NXDL paths.
+
+    Preference:
+      1) NXnote/(data|description|context|comment|text)
+      2) NXprocess/.../(description|comment|note-like leaf)
+      3) any leaf that looks like a free-text sink (description/comment/context)
+    """
+    if not allowed_paths:
+        return ""
+
+    aps = [p for p in allowed_paths if isinstance(p, str)]
+    aps_l = [(p, p.lower()) for p in aps]
+
+    # Helper: choose shortest path among matches (often more canonical)
+    def pick(matches: list[str]) -> str:
+        if not matches:
+            return ""
+        matches.sort(key=lambda x: (len(x), x))
+        return matches[0]
+
+    # 1) Strong preference: NXnote leaf fields
+    note_leaf_priority = ("/data", "/description", "/context", "/comment", "/text", "/type", "/title")
+    note_matches = []
+    for p, pl in aps_l:
+        if "nxnote" in pl:
+            for suf in note_leaf_priority:
+                if pl.endswith(suf):
+                    note_matches.append(p)
+                    break
+    chosen = pick(note_matches)
+    if chosen:
+        return chosen
+
+    # 2) NXprocess sinks
+    proc_leaf_priority = ("/description", "/comment", "/context", "/type", "/title")
+    proc_matches = []
+    for p, pl in aps_l:
+        if "nxprocess" in pl:
+            for suf in proc_leaf_priority:
+                if pl.endswith(suf):
+                    proc_matches.append(p)
+                    break
+    chosen = pick(proc_matches)
+    if chosen:
+        return chosen
+
+    # 3) NXcollection sinks
+    coll_leaf_priority = ("/data", "/description", "/comment", "/context")
+    coll_matches = []
+    for p, pl in aps_l:
+        if "nxcollection" in pl:
+            for suf in coll_leaf_priority:
+                if pl.endswith(suf):
+                    coll_matches.append(p)
+                    break
+    chosen = pick(coll_matches)
+    if chosen:
+        return chosen
+
+    # 4) Last-resort generic sinks anywhere
+    generic_priority = ("/description", "/comment", "/context")
+    generic_matches = []
+    for p, pl in aps_l:
+        for suf in generic_priority:
+            if pl.endswith(suf):
+                generic_matches.append(p)
+                break
+    return pick(generic_matches)
+
+
+def _should_stash_encoding_key(meta_key: str, proposed_path: str) -> bool:
+    """
+    Minimal concrete suggestion:
+    - For file encoding-ish keys, avoid accepting mappings into unrelated instrument fields.
+    - If the proposed path is not in safe zones, stash.
+    """
+    k = (meta_key or "").strip().lower()
+    if k not in ENCODING_KEYS:
+        return False
+    pl = (proposed_path or "").lower()
+    if not pl:
+        return True
+    return not any(z in pl for z in SAFE_ZONES_FOR_ENCODING)
+
 
 # =========================================
 # JSON extraction helper
@@ -42,10 +165,11 @@ def robust_json_from_text(text: str) -> dict:
         raise ValueError("No JSON object found in response")
     candidate = m.group(0)
     candidate = candidate.replace("“", '"').replace("”", '"').replace("’", "'")
-    candidate = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', candidate)
-    candidate = re.sub(r',\s*(?=[}\]])', '', candidate)
+    candidate = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", candidate)
+    candidate = re.sub(r",\s*(?=[}\]])", "", candidate)
     decoder = json.JSONDecoder(strict=False)
     return decoder.decode(candidate)
+
 
 # =========================================
 # Prompt builders (instrument & experiment)
@@ -73,14 +197,10 @@ Strict output format:
 - Return exactly one line of JSON.
 
 ✅ Example valid responses:
-{
-  "instrument": "TESCAN Vega3"
-}
+{"instrument":"TESCAN Vega3"}
 
 or if missing:
-{
-  "instrument": "unknown"
-}
+{"instrument":"unknown"}
 """
     )
 
@@ -113,17 +233,261 @@ Rules:
 - Respond strictly in one-line JSON format.
 
 Correct response examples:
-{
-  "experiment": "SEM"
-}
-{
-  "experiment": "Other"
-}
+{"experiment":"SEM"}
+{"experiment":"Other"}
 
 ❌ Do NOT include explanations, markdown, or extra text.
 ✅ Return only one valid JSON object.
 """
     )
+
+
+# =========================================
+# Tokenisation helper
+# =========================================
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def _tok(text: str) -> list[str]:
+    return _WORD_RE.findall(_norm(text))
+
+
+# =========================================
+# Canonicalize NeXus paths
+# =========================================
+def _canonicalize_example_path(p: str) -> str:
+    if not isinstance(p, str):
+        return ""
+    s = p.strip()
+    if s.startswith("/ENTRY"):
+        s = "NXentry" + s[len("/ENTRY") :]
+    elif s.startswith("ENTRY"):
+        s = "NXentry" + s[len("ENTRY") :]
+    elif s.startswith("/NXentry"):
+        s = s[1:]
+    if s.startswith("/"):
+        s = s[1:]
+    return s
+
+
+def _normalize_path(p: str) -> str:
+    if not isinstance(p, str):
+        return ""
+    return p[1:] if p.startswith("/") else p
+
+
+# =========================================
+# 5-cluster routing
+# =========================================
+CLUSTERS = {
+    "C1_IMAGE_ACQ": {
+        "label": "Image & acquisition",
+        "path_hints": [
+            "/image_set/",
+            "/image_em",
+            "/NXimage",
+            "/NXdata",
+            "/imaging",
+            "pixel",
+            "axis_",
+            "shape_",
+            "field_of_view",
+            "magnification",
+            "zoom",
+            "exposure",
+        ],
+        "key_hints": [
+            "image",
+            "img",
+            "width",
+            "height",
+            "length",
+            "pixel",
+            "resolution",
+            "dpi",
+            "fov",
+            "field",
+            "magn",
+            "zoom",
+            "frame",
+            "exposure",
+            "scan",
+        ],
+    },
+    "C2_BEAM_OPTICS": {
+        "label": "Beam & optics",
+        "path_hints": [
+            "/ebeam/",
+            "accelerating_voltage",
+            "beam_current",
+            "probe_current",
+            "gun",
+            "lens",
+            "aperture",
+            "spot",
+        ],
+        "key_hints": ["hv", "eht", "voltage", "kv", "beam", "probe", "current", "spot", "aperture", "lens"],
+    },
+    "C3_STAGE_GEOM": {
+        "label": "Stage & geometry",
+        "path_hints": ["/stage_lab/", "working_distance", "tilt", "rotation", "/position/"],
+        "key_hints": ["wd", "working", "distance", "stage", "tilt", "rotate", "rotation", "x", "y", "z"],
+    },
+    "C4_DETECTOR_SIGNAL": {
+        "label": "Detector & signal",
+        "path_hints": ["detector_em", "detector", "signal", "bse", "se", "etd", "inlens", "mode", "channel"],
+        "key_hints": ["detector", "signal", "bse", "se", "etd", "inlens", "channel", "mode"],
+    },
+    "C5_PROV_PROC_INSTR": {
+        "label": "Provenance / processing / instrument",
+        "path_hints": [
+            "/process",
+            "compression",
+            "gamma",
+            "brightness",
+            "contrast",
+            "software",
+            "vendor",
+            "model",
+            "manufacturer",
+            "/instrument",
+            "/user",
+            "start_time",
+        ],
+        "key_hints": [
+            "vendor",
+            "model",
+            "instrument",
+            "system",
+            "software",
+            "user",
+            "operator",
+            "date",
+            "time",
+            "timestamp",
+            "compression",
+            "gamma",
+            "contrast",
+            "brightness",
+            "comment",
+            "raw",
+            "metadata",
+            "tag",
+        ],
+    },
+}
+
+
+def _key_tokens_for_cluster(key: str) -> set[str]:
+    k = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(key))
+    return set(_tok(k))
+
+
+def similarity_score_tokens(q_tokens: set[str], ex_tokens: set[str]) -> float:
+    if not q_tokens or not ex_tokens:
+        return 0.0
+    inter = len(q_tokens & ex_tokens)
+    union = len(q_tokens | ex_tokens)
+    return (inter / union) + 0.15 * inter
+
+
+def _example_cluster_from_path(nx_path: str) -> str:
+    p = (nx_path or "").lower()
+    for cid, cinfo in CLUSTERS.items():
+        for h in cinfo["path_hints"]:
+            if h.lower() in p:
+                return cid
+    return "C5_PROV_PROC_INSTR"
+
+
+def _example_cluster_from_key(key: str) -> str | None:
+    kt = _key_tokens_for_cluster(key)
+    for cid, cinfo in CLUSTERS.items():
+        if any(h in kt for h in cinfo["key_hints"]):
+            return cid
+    return None
+
+
+def load_all_example_pairs_from_dir(example_dir: Path, definition_prefix: str = "NXem") -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    if not example_dir.exists():
+        return pairs
+    for p in example_dir.glob(f"{definition_prefix}__*.json"):
+        try:
+            raw = json.load(open(p, "r", encoding="utf-8"))
+            if not isinstance(raw, dict):
+                continue
+            for k, info in raw.items():
+                if isinstance(info, dict) and "nx_path" in info:
+                    nxp = _canonicalize_example_path(str(info["nx_path"]))
+                    if nxp:
+                        pairs.append((str(k), nxp))
+        except Exception:
+            continue
+    return pairs
+
+
+def build_example_index(example_pairs: list[tuple[str, str]]) -> dict:
+    exact_key_to_paths: dict[str, Counter] = {}
+    exact_key_to_clusters: dict[str, Counter] = {}
+    cluster_examples: dict[str, list[tuple[str, str]]] = {cid: [] for cid in CLUSTERS.keys()}
+
+    for key, nxp in example_pairs:
+        kl = key.strip().lower()
+        c_from_path = _example_cluster_from_path(nxp)
+        c_from_key = _example_cluster_from_key(key)
+        cluster = c_from_key or c_from_path
+
+        exact_key_to_paths.setdefault(kl, Counter())[nxp] += 1
+        exact_key_to_clusters.setdefault(kl, Counter())[cluster] += 1
+        cluster_examples.setdefault(cluster, []).append((key, nxp))
+
+    exact_key_map: dict[str, str] = {}
+    key_to_cluster: dict[str, str] = {}
+    for kl, cnt in exact_key_to_paths.items():
+        exact_key_map[kl] = cnt.most_common(1)[0][0]
+    for kl, cnt in exact_key_to_clusters.items():
+        key_to_cluster[kl] = cnt.most_common(1)[0][0]
+
+    return {"exact_key_map": exact_key_map, "key_to_cluster": key_to_cluster, "cluster_examples": cluster_examples}
+
+
+def route_cluster(index: dict, key: str) -> tuple[str, str]:
+    kl = key.strip().lower()
+    if kl in index.get("key_to_cluster", {}):
+        return index["key_to_cluster"][kl], "exact-key (examples)"
+    c_hint = _example_cluster_from_key(key)
+    if c_hint:
+        return c_hint, "key-hints"
+    return "C5_PROV_PROC_INSTR", "fallback"
+
+
+def pick_similar_examples(index: dict, cluster_id: str, key: str, top_n: int = 6) -> list[tuple[str, str, float]]:
+    q_tokens = _key_tokens_for_cluster(key)
+    candidates = index.get("cluster_examples", {}).get(cluster_id, [])
+    scored: list[tuple[str, str, float]] = []
+    for ex_key, ex_path in candidates:
+        s = similarity_score_tokens(q_tokens, _key_tokens_for_cluster(ex_key))
+        if s > 0:
+            scored.append((ex_key, ex_path, s))
+    scored.sort(key=lambda t: t[2], reverse=True)
+    return scored[:top_n]
+
+
+def filter_paths_by_cluster(allowed_paths: list[str], cluster_id: str) -> list[str]:
+    if not allowed_paths:
+        return []
+    hints = [h.lower() for h in CLUSTERS[cluster_id]["path_hints"]]
+    out = []
+    for p in allowed_paths:
+        pl = p.lower()
+        if "nxentry" not in pl:
+            continue
+        if any(h in pl for h in hints):
+            out.append(p)
+    return out if len(out) >= 30 else allowed_paths
+
 
 # =========================================
 # LLM prompt for mapping (with examples)
@@ -139,72 +503,51 @@ def build_single_key_mapping_prompt(
     allowed_text = "\n".join("- " + p for p in allowed_subset) if allowed_subset else "- (no paths)"
 
     if example_pairs:
-        example_lines = "\n".join(
-            f'- "{k}" → "{p}"' for (k, p) in example_pairs
-        )
+        ex_lines = "\n".join([f'- "{k}" → "{p}"' for k, p in example_pairs])
         examples_block = f"""
-Example mappings from other {definition} instruments
-(metadata key → NeXus path):
-{example_lines}
+Similar keys from curated examples (key → path):
+{ex_lines}
 
-Use these as guidance: if the current key is similar to an example key,
-prefer a NeXus path that plays an analogous role.
+Use these as guidance. Prefer choosing the best candidate from the allowed list.
 """
     else:
-        examples_block = "\n(No example mappings available for this key.)\n"
+        examples_block = "No curated examples found for a similar key.\n"
 
     return f"""
 You are a FAIRmat metadata assistant.
 
 Goal:
-Given ONE metadata key and its value, pick the **best matching NeXus path** from the allowed list.
+Given ONE metadata key and its value, pick the best matching NeXus path from the allowed list.
 
-Important:
-- You should **prefer choosing the best candidate** over returning an empty string.
-- Return "" only if **none** of the allowed paths are meaningfully related to this metadata key.
-- It is acceptable to make a reasonable choice when multiple paths are plausible.
+Guidance:
+- Prefer choosing the best candidate over returning "".
+- Return "" only if none of the allowed paths are meaningfully related.
 
-Selected NeXus application:
+Definition:
 {definition}
 
 Metadata context (truncated):
 {metadata_context_snippet}
 
-Metadata key to map:
-- key: "{selected_key}"
+Key:
+- "{selected_key}"
 - value preview: {value_preview}
 
 {examples_block}
 
-Allowed NeXus paths (choose at most one; do NOT invent):
+Allowed NeXus paths (choose one; do NOT invent):
 {allowed_text}
 
-Strict output rules:
-- Output ONLY JSON (no prose), with this exact shape:
-  {{
-    "mapping": {{"{selected_key}": "<one_allowed_path_or_empty>"}}
-  }}
-- The chosen path MUST be one of the allowed paths above (or "").
-- You may reuse a path from the examples if it is also present in the allowed list.
-- Prefer the most specific field if multiple are reasonable.
+Return ONLY one JSON object:
+{{
+  "mapping": {{"{selected_key}": "<one_allowed_path_or_empty>"}}
+}}
 """
 
-# ==================================================
-# Tokenisation helper
-# ==================================================
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", text.lower()).strip()
 
-
-def _tok(text: str) -> list[str]:
-    return _WORD_RE.findall(_norm(text))
-
-# ==================================================
-# Lexical ranking of NeXus paths
-# ==================================================
-_GENERIC_LEAVES = {"name", "title", "value", "data", "type", "model"}  # mild penalty
-
-
+# =========================================
+# Lexical ranking of NeXus paths (exponential)
+# =========================================
 def _bigrams(tokens: list[str]) -> set[tuple[str, str]]:
     return {(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)} if len(tokens) >= 2 else set()
 
@@ -227,56 +570,14 @@ def _build_path_doc_tokens(path: str) -> list[str]:
 def build_path_index(allowed_paths: list[str]) -> list[dict]:
     index = []
     for p in allowed_paths:
-        if not p or len(p) >= 200:
+        if not p or len(p) >= 220:
             continue
         parts = _split_path_parts(p)
         leaf = parts[-1].lower() if parts else ""
         tokens = _build_path_doc_tokens(p)
-        entry = {
-            "path": p,
-            "leaf": leaf,
-            "tokens": tokens,
-            "bigrams": _bigrams(tokens),
-            "depth": len(parts),
-        }
+        entry = {"path": p, "leaf": leaf, "tokens": tokens, "bigrams": _bigrams(tokens), "depth": len(parts)}
         index.append(entry)
     return index
-
-
-def _lexical_score(query_tokens: list[str], query_bigrams: set[tuple[str, str]], entry: dict) -> float:
-    doc_tokens = entry["tokens"]
-    doc_bigrams = entry["bigrams"]
-    leaf = entry["leaf"]
-    depth = entry["depth"]
-    path_l = entry["path"].lower()
-
-    q_counts = Counter(query_tokens)
-    d_counts = Counter(doc_tokens)
-
-    # unigram overlap
-    uni = 0
-    for t, qc in q_counts.items():
-        if t in d_counts:
-            uni += min(qc, d_counts[t])
-
-    # bigram overlap
-    bi = len(query_bigrams & doc_bigrams)
-
-    # substring hits (e.g., width in /image_width/)
-    sub_hits = 0
-    for t in set(query_tokens):
-        if len(t) >= 3:
-            if t in leaf:
-                sub_hits += 1
-            elif t in path_l:
-                sub_hits += 0.5
-
-    score = 3.0 * uni + 2.0 * bi + 1.0 * sub_hits + 0.25 * min(depth, 12)
-
-    # penalize very generic leaf names if they don't appear in the query
-    if (leaf in _GENERIC_LEAVES) and (leaf not in query_tokens):
-        score -= 1.0
-    return score
 
 
 def make_query_tokens(key: str, value_preview: str, sibling_keys: list[str]) -> tuple[list[str], set[tuple[str, str]]]:
@@ -287,16 +588,43 @@ def make_query_tokens(key: str, value_preview: str, sibling_keys: list[str]) -> 
     return q_tokens, q_bigrams
 
 
-def _get_path_index_for_definition(allowed_paths: list[str], definition: str) -> list[dict]:
-    """
-    Cache a path index per definition in the session state.
-    """
-    key_idx = "_path_index"
-    key_def = "_path_index_definition"
-    if (key_idx not in st.session_state) or (st.session_state.get(key_def) != definition):
-        st.session_state[key_idx] = build_path_index(allowed_paths)
-        st.session_state[key_def] = definition
-    return st.session_state[key_idx]
+def _lexical_score(query_tokens: list[str], query_bigrams: set[tuple[str, str]], entry: dict) -> float:
+    doc_tokens = entry["tokens"]
+    doc_bigrams = entry["bigrams"]
+    leaf = entry["leaf"].lower()
+    depth = entry["depth"]
+    path_l = entry["path"].lower()
+
+    q_counts = Counter(query_tokens)
+    d_counts = Counter(doc_tokens)
+
+    uni = 0
+    for t, qc in q_counts.items():
+        if t in d_counts:
+            uni += min(qc, d_counts[t])
+
+    bi = len(query_bigrams & doc_bigrams)
+
+    sub_hits = 0.0
+    for t in set(query_tokens):
+        if len(t) >= 3:
+            if t in leaf:
+                sub_hits += 1.0
+            elif t in path_l:
+                sub_hits += 0.5
+
+    A, B, C, D = 1.10, 1.80, 0.75, 0.08
+    linear_score = A * uni + B * bi + C * sub_hits + D * depth
+    if linear_score > 20.0:
+        linear_score = 20.0
+    return math.exp(linear_score)
+
+
+def _get_path_index_for_pool(allowed_paths: list[str], cache_key: str) -> list[dict]:
+    idx_key = f"_path_index::{cache_key}"
+    if idx_key not in st.session_state:
+        st.session_state[idx_key] = build_path_index(allowed_paths)
+    return st.session_state[idx_key]
 
 
 def prioritize_paths_lexical(
@@ -304,12 +632,13 @@ def prioritize_paths_lexical(
     key: str,
     value_preview: str,
     sibling_keys: list[str],
-    definition: str,
+    cache_key: str,
     top_k: int = PER_KEY_CANDIDATE_LIMIT,
     show_debug: bool = False,
 ) -> list[str]:
-    path_index = _get_path_index_for_definition(allowed_paths, definition)
+    path_index = _get_path_index_for_pool(allowed_paths, cache_key)
     q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
+
     scored = []
     for entry in path_index:
         s = _lexical_score(q_tokens, q_bigrams, entry)
@@ -321,13 +650,92 @@ def prioritize_paths_lexical(
     if show_debug:
         st.markdown(f"**{key} — top {len(top)} lexical candidates**")
         for i, (p, sc, depth) in enumerate(top, start=1):
-            st.write(f"{i:02d}. {p} — score={sc:.1f}, depth={depth}")
+            st.write(f"{i:02d}. {p} — score={sc:.2f}, depth={depth}")
 
     return [p for p, _, _ in top]
 
-# ==============================
+
+# =========================================
+# Deterministic + hybrid mapping (minimize LLM)
+# =========================================
+def prioritize_paths_lexical_scored(
+    allowed_paths: list[str],
+    key: str,
+    value_preview: str,
+    sibling_keys: list[str],
+    cache_key: str,
+    top_k: int = PER_KEY_CANDIDATE_LIMIT,
+) -> list[tuple[str, float, int]]:
+    path_index = _get_path_index_for_pool(allowed_paths, cache_key)
+    q_tokens, q_bigrams = make_query_tokens(key, value_preview, sibling_keys)
+
+    scored: list[tuple[str, float, int]] = []
+    for entry in path_index:
+        s = float(_lexical_score(q_tokens, q_bigrams, entry))
+        scored.append((entry["path"], s, int(entry["depth"])))
+
+    scored.sort(key=lambda t: (t[1], t[2], -len(t[0])), reverse=True)
+    return scored[:top_k]
+
+
+def compute_confidence_from_scores(s1: float, s2: float) -> tuple[float, float]:
+    if s1 <= 0:
+        return 0.0, 0.0
+    s2 = max(s2, 1e-12)
+    log_ratio = math.log(s1 / s2)
+    conf = 0.50 + 0.25 * min(2.0, max(0.0, log_ratio))
+    conf = float(max(0.0, min(0.99, conf)))
+    return conf, float(log_ratio)
+
+
+def deterministic_pick_path(
+    aps_list: list[str],
+    index: dict,
+    definition: str,
+    key: str,
+    value_preview: str,
+    sibling_keys: list[str],
+) -> dict:
+    cluster_id, cluster_reason = route_cluster(index, key)
+    cluster_paths = filter_paths_by_cluster(aps_list, cluster_id)
+    cache_key = f"{definition}::{cluster_id}"
+
+    scored = prioritize_paths_lexical_scored(
+        allowed_paths=cluster_paths,
+        key=key,
+        value_preview=value_preview,
+        sibling_keys=sibling_keys,
+        cache_key=cache_key,
+        top_k=PER_KEY_CANDIDATE_LIMIT,
+    )
+
+    if not scored:
+        return {
+            "chosen": "",
+            "confidence": 0.0,
+            "log_ratio": 0.0,
+            "cluster_id": cluster_id,
+            "cluster_reason": cluster_reason,
+            "candidates": [],
+        }
+
+    p1, s1, d1 = scored[0]
+    s2 = scored[1][1] if len(scored) > 1 else (s1 / 1.5)
+    conf, log_ratio = compute_confidence_from_scores(s1, s2)
+
+    return {
+        "chosen": p1,
+        "confidence": conf,
+        "log_ratio": log_ratio,
+        "cluster_id": cluster_id,
+        "cluster_reason": cluster_reason,
+        "candidates": [{"path": p, "score": sc, "depth": dep} for (p, sc, dep) in scored[:5]],
+    }
+
+
+# =========================================
 # Helpers for mapping
-# ==============================
+# =========================================
 def flatten_metadata_keys(data, parent=""):
     keys = []
     if isinstance(data, dict):
@@ -353,14 +761,13 @@ def get_value_preview(data: dict, dotted_key: str, max_len: int = 240) -> str:
         s = repr(node)
     except Exception:
         s = "None"
-    if s is None:
-        s = "None"
-    s = str(s)
+    s = "None" if s is None else str(s)
     return (s[:max_len] + "…") if len(s) > max_len else s
 
-# ==============================
+
+# =========================================
 # NXDL filesystem + XML parsing
-# ==============================
+# =========================================
 EXPERIMENT_TO_NX = {
     "SEM": "NXem",
     "TEM": "NXem",
@@ -379,21 +786,16 @@ EXPERIMENT_TO_NX = {
     "Other": "Other",
 }
 
-# Optional explicit instrument→definition overrides
 INSTRUMENT_TO_NX_DEF = {
     # "tescan amber x": "NXem",
-    # "nova nanosem 450": "NXem",
 }
+
 
 def normalize_instrument_name(name: str | None) -> str:
     return (name or "").strip().lower()
 
 
 def pick_nexus_definition(instrument_name: str, experiment_type: str) -> str:
-    """
-    First use explicit instrument→definition overrides if present.
-    Otherwise fall back to experiment_type→EXPERIMENT_TO_NX.
-    """
     inst_norm = normalize_instrument_name(instrument_name)
     for inst_key, nx_def in INSTRUMENT_TO_NX_DEF.items():
         if inst_key in inst_norm:
@@ -406,15 +808,6 @@ def _strip_ns(tag: str) -> str:
 
 
 def find_definition_xml(definition: str) -> Path | None:
-    """
-    Find the best NXDL file for a given application definition.
-
-    Heuristics:
-    - Only consider stems that start with the requested definition, e.g. "nxem".
-    - Prefer an exact stem match ("nxem") over suffixed variants ("nxem_eels").
-    - Prefer files in 'applications/' over 'contributed_definitions/'.
-    - Among the rest, prefer shorter stems (more general).
-    """
     stem_lower = definition.lower()
     best_path: Path | None = None
     best_score = float("-inf")
@@ -435,8 +828,6 @@ def find_definition_xml(definition: str) -> Path | None:
             parent_str = str(p.parent).lower()
             if "applications" in parent_str:
                 score += 20.0
-            elif "contributed_definitions" in parent_str:
-                score += 0.0
 
             if score > best_score:
                 best_score = score
@@ -503,165 +894,10 @@ def load_definition_schema_xml(definition: str, debug: bool = False) -> tuple[Pa
 
     return xml_path, allowed
 
-# ==============================
-# Curated example mappings (per-instrument) + global example pairs
-# ==============================
-_EXAMPLE_MAPPING_CACHE: dict[str, dict[str, str]] = {}  # filepath -> {meta_key -> nx_path}
-_ALL_EXAMPLE_PAIRS_CACHE: dict[str, list[tuple[str, str]]] = {}  # definition -> [(meta_key, nx_path)]
 
-
-def normalize_instr_for_filename(name: str) -> str:
-    """Normalize instrument name to a safe filename fragment."""
-    s = (name or "").lower()
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    return s.strip("_")
-
-
-def _canonicalize_example_path(p: str) -> str:
-    """
-    Convert example paths like '/ENTRY/...' or 'ENTRY/...' into NXDL-style paths:
-      'NXentry/...'
-    and remove any leading slash.
-    """
-    if not isinstance(p, str):
-        return p
-
-    p = p.strip()
-
-    # Replace common variants of ENTRY with NXentry
-    if p.startswith("/ENTRY"):
-        p = "NXentry" + p[len("/ENTRY") :]
-    elif p.startswith("ENTRY"):
-        p = "NXentry" + p[len("ENTRY") :]
-    elif p.startswith("/NXentry"):
-        p = p[1:]  # drop leading slash
-
-    if p.startswith("/"):
-        p = p[1:]
-
-    return p
-
-
-def mapping_path_for(definition: str, instrument_name: str) -> Path:
-    """
-    Build the expected JSON path for a given (definition, instrument).
-    Example: NXem + 'Nova NanoSEM 450'
-    -> example_mappings/NXem__nova_nanosem_450.json
-    """
-    instr_norm = normalize_instr_for_filename(instrument_name)
-    fname = f"{definition}__{instr_norm}.json"
-    return EXAMPLE_MAPPINGS_DIR / fname
-
-
-def _load_single_example_mapping(path: Path) -> dict[str, str] | None:
-    """
-    Load one example mapping file and convert to {meta_key -> nx_path}.
-    """
-    global _EXAMPLE_MAPPING_CACHE
-
-    key = str(path)
-    if key in _EXAMPLE_MAPPING_CACHE:
-        return _EXAMPLE_MAPPING_CACHE[key]
-
-    if not path.exists():
-        return None
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception:
-        return None
-
-    if not isinstance(raw, dict):
-        return None
-
-    mapping: dict[str, str] = {}
-    for meta_key, info in raw.items():
-        if isinstance(info, dict) and "nx_path" in info:
-            nx_path = _canonicalize_example_path(str(info["nx_path"]))
-            mapping[str(meta_key)] = nx_path
-
-    if not mapping:
-        return None
-
-    _EXAMPLE_MAPPING_CACHE[key] = mapping
-    return mapping
-
-
-def get_example_mapping_for(instrument_name: str, definition: str) -> dict[str, str] | None:
-    """
-    Instrument-specific curated mapping: (definition, instrument) → {key -> nx_path}
-    """
-    if not instrument_name:
-        return None
-
-    path = mapping_path_for(definition, instrument_name)
-    return _load_single_example_mapping(path)
-
-
-def _load_all_example_pairs(definition: str) -> list[tuple[str, str]]:
-    """
-    Build a global list of (meta_key, nx_path) pairs for one definition
-    by reading ALL example JSON files for that definition (NXem__*.json).
-    """
-    global _ALL_EXAMPLE_PAIRS_CACHE
-    if definition in _ALL_EXAMPLE_PAIRS_CACHE:
-        return _ALL_EXAMPLE_PAIRS_CACHE[definition]
-
-    pairs: list[tuple[str, str]] = []
-
-    if EXAMPLE_MAPPINGS_DIR.exists():
-        pattern = f"{definition}__*.json"
-        for p in EXAMPLE_MAPPINGS_DIR.glob(pattern):
-            m = _load_single_example_mapping(p)
-            if not m:
-                continue
-            for k, nx_path in m.items():
-                pairs.append((k, nx_path))
-
-    _ALL_EXAMPLE_PAIRS_CACHE[definition] = pairs
-    return pairs
-
-
-def _key_similarity_score(q_key: str, ex_key: str) -> float:
-    """
-    Simple lexical similarity between two metadata keys.
-    """
-    q_tokens = set(_tok(q_key))
-    e_tokens = set(_tok(ex_key))
-    if not q_tokens or not e_tokens:
-        return 0.0
-
-    overlap = len(q_tokens & e_tokens)
-    substring = 1.0 if (ex_key.lower() in q_key.lower() or q_key.lower() in ex_key.lower()) else 0.0
-    return 2.0 * overlap + substring
-
-
-def get_example_pairs_for_key(definition: str, key: str, top_n: int = 6) -> list[tuple[str, str]]:
-    """
-    For a given key, return the top-N most similar example key→path pairs
-    from all known instruments for this definition.
-    """
-    all_pairs = _load_all_example_pairs(definition)
-    if not all_pairs:
-        return []
-
-    scored = []
-    for ex_key, nx_path in all_pairs:
-        s = _key_similarity_score(key, ex_key)
-        if s > 0:
-            scored.append((ex_key, nx_path, s))
-
-    if not scored:
-        return []
-
-    scored.sort(key=lambda t: t[2], reverse=True)
-    top = scored[:top_n]
-    return [(k, p) for (k, p, _) in top]
-
-# ==============================
+# =========================================
 # Mapping DB (instrument + definition)
-# ==============================
+# =========================================
 MAPPING_DB_PATH = BASE_DIR / "mapping_db.json"
 
 
@@ -694,90 +930,72 @@ def _mapping_db_get(instrument: str, definition: str) -> dict | None:
     return db.get(_db_key(instrument, definition))
 
 
-def _mapping_db_put(instrument: str, definition: str, mapping: dict) -> None:
+def _mapping_db_put(
+    instrument: str,
+    definition: str,
+    mapping_simple: dict,
+    mapping_full: dict | None = None,
+) -> None:
     db = _mapping_db_load()
     db[_db_key(instrument, definition)] = {
-        "mapping": mapping or {},
+        "mapping": mapping_simple or {},
+        "mapping_full": mapping_full,
         "definition": definition,
         "instrument": instrument,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _mapping_db_save(db)
 
-# ==============================
-# Small normalization helper
-# ==============================
-def _normalize_path(p: str) -> str:
-    """Drop a leading slash if the model returns '/ENTRY/...' instead of 'ENTRY/...'. """
-    if not isinstance(p, str):
-        return p
-    return p[1:] if p.startswith("/") else p
 
-# ==============================
+# =========================================
 # App UI
-# ==============================
+# =========================================
 load_dotenv()
 LOGO_NFFA = "https://raw.githubusercontent.com/elahehsaadat/fair-nexus-gui/main/assets/nffa.png"
 LOGO_LADE = "https://raw.githubusercontent.com/elahehsaadat/fair-nexus-gui/main/assets/area.png"
 
-st.set_page_config(
-    page_title="FAIR NeXus File Metadata Assistant — Step 1 + Mapping (beta)",
-    layout="centered",
-)
+st.set_page_config(page_title="FAIR NeXus File Metadata Assistant — Step 1 + Mapping (beta)", layout="centered")
 
 with st.sidebar:
     st.image(LOGO_NFFA, caption="NFFA-DI")
     st.image(LOGO_LADE, caption="AREA Science Park")
 
 st.title("🔬 FAIR NeXus Assistant — Step 1 + Mapping (beta)")
-st.caption(
-    "Upload → preview → extract metadata → instrument/experiment via LLM → select NXDL → "
-    "map keys to NeXus paths (curated examples + lexical ranking + LLM)."
-)
+st.caption("Upload → preview → extract metadata → instrument/experiment via LLM → select NXDL → map keys to NeXus paths.")
 
-# LLM model selection
 models = get_ollama_models()
 if not models:
-    st.error("⚠️ No models found. Start one on your Ollama host (e.g., `ollama run llama3`), then refresh.")
+    st.error("⚠️ No models found. Start one on your Ollama host, then refresh.")
     st.stop()
 
 selected_model = st.selectbox("LLM model served by Ollama", models)
 workflow = st.radio("Choose a workflow", ["Upload image + metadata", "Reference a stack (folder / S3 URL)"])
 
-# Basic metadata
 if "meta" not in st.session_state:
     st.session_state.meta = {"instrument": "", "sample_id": "", "operator": ""}
 
 st.subheader("📄 Basic metadata")
 for k in list(st.session_state.meta.keys()):
-    st.session_state.meta[k] = st.text_input(
-        k.replace("_", " ").title(), st.session_state.meta[k], key=f"meta_{k}"
-    )
+    st.session_state.meta[k] = st.text_input(k.replace("_", " ").title(), st.session_state.meta[k], key=f"meta_{k}")
 
 meta = st.session_state.meta
 
-# ==============================
+# =========================================
 # Workflow: Upload image + metadata
-# ==============================
+# =========================================
 if workflow == "Upload image + metadata":
-    file = st.file_uploader(
-        "Upload microscopy image", type=["tif", "tiff", "png", "jpg", "jpeg"], key="file_uploader"
-    )
-    header = st.file_uploader(
-        "(Optional) Upload separate metadata (JSON)", type="json", key="json_uploader"
-    )
+    file = st.file_uploader("Upload microscopy image", type=["tif", "tiff", "png", "jpg", "jpeg"], key="file_uploader")
+    header = st.file_uploader("(Optional) Upload separate metadata (JSON)", type="json", key="json_uploader")
 
     if file is None:
         st.info("👆 Upload an image to get started.")
         st.stop()
 
-    # Preview image
     image = read_image_any_format(file)
     st.session_state.image_array = image
     st.session_state.preview = convert_to_preview(image)
     st.image(st.session_state.preview, caption="Preview", use_container_width=True)
 
-    # Extract metadata
     instrument_metadata = {}
     filename = getattr(file, "name", "")
     if filename.lower().endswith((".tif", ".tiff")):
@@ -799,15 +1017,11 @@ if workflow == "Upload image + metadata":
     st.subheader("Extracted Metadata")
     st.json(instrument_metadata)
 
-    # Pretty JSON for prompts + keep in session for mapping step
     safe_metadata = make_json_safe(instrument_metadata)
     pretty_metadata = json.dumps(safe_metadata, indent=2)
     st.session_state.safe_metadata = safe_metadata
     st.session_state.pretty_metadata = pretty_metadata
 
-    # --------------------
-    # LLM (instrument + experiment) + NXDL load
-    # --------------------
     if "step1_results" not in st.session_state:
         st.info("Click the button below to analyze metadata with the selected model.")
 
@@ -820,12 +1034,8 @@ if workflow == "Upload image + metadata":
                 "experiment_type": "Other",
             }
 
-            # Instrument
             try:
-                raw_inst = query_ollama(
-                    build_instrument_detection_prompt(pretty_metadata),
-                    model=selected_model,
-                )
+                raw_inst = query_ollama(build_instrument_detection_prompt(pretty_metadata), model=selected_model)
                 results["raw_instrument"] = raw_inst
                 try:
                     parsed_inst = extract_json_from_response(raw_inst)
@@ -835,7 +1045,6 @@ if workflow == "Upload image + metadata":
             except Exception as e:
                 st.error(f"❌ Failed to extract instrument: {e}")
 
-            # Experiment type
             try:
                 raw_exp = query_ollama(
                     build_experiment_type_prompt(pretty_metadata, results["instrument_name"]),
@@ -850,11 +1059,7 @@ if workflow == "Upload image + metadata":
             except Exception as e:
                 st.error(f"❌ Failed to classify experiment type: {e}")
 
-            # Pick NX app using instrument overrides if any, else experiment type
-            definition = pick_nexus_definition(
-                instrument_name=results["instrument_name"],
-                experiment_type=results["experiment_type"],
-            )
+            definition = pick_nexus_definition(results["instrument_name"], results["experiment_type"])
             xml_path, allowed_paths = load_definition_schema_xml(definition)
 
             st.session_state.step1_results = results
@@ -862,7 +1067,10 @@ if workflow == "Upload image + metadata":
             st.session_state.nxdl_path = str(xml_path) if xml_path else None
             st.session_state.allowed_paths = sorted(list(allowed_paths)) if allowed_paths else []
 
-    # Show results (if any)
+            # cache stash field for this definition
+            aps_list = st.session_state.get("allowed_paths", [])
+            st.session_state["_stash_field_path"] = _find_best_stash_field(aps_list)
+
     if "step1_results" in st.session_state:
         res = st.session_state.step1_results
         st.subheader("🔍 LLM Raw Responses")
@@ -887,72 +1095,53 @@ if workflow == "Upload image + metadata":
             if aps:
                 st.code("\n".join(aps[:60]), language="text")
 
-        # ==============================
-        # Map keys → NeXus paths
-        # ==============================
+        # Show stash field discovery
+        stash_field = st.session_state.get("_stash_field_path", "")
+        st.subheader("📦 Unmapped metadata stash (schema-valid)")
+        if stash_field:
+            st.success(f"Stash field found in NXDL: **{stash_field}**")
+            st.caption(
+                "Unmapped keys will be stored as a JSON blob in this existing field (no invented paths)."
+            )
+        else:
+            st.warning(
+                "No obvious NXnote/NXprocess description-like field was found in allowed_paths. "
+                "Unmapped keys will still be listed, but you may need to pick a storage location manually."
+            )
+
         st.subheader("🧭 Map metadata keys to NeXus paths")
 
-        aps = st.session_state.get("allowed_paths", [])
+        aps_list = st.session_state.get("allowed_paths", [])
         safe_md = st.session_state.get("safe_metadata", {})
         pretty_md = st.session_state.get("pretty_metadata", "")
-        instrument_name = st.session_state.step1_results.get("instrument_name", "unknown")
-        definition = st.session_state.get("nexus_definition", "NXem")
 
-        if not aps:
+        if not aps_list:
             st.info("No allowed paths found for the selected definition — cannot map.")
         else:
-            # ----------------------------------
-            # 1) Try curated example mapping first (instrument-specific)
-            # ----------------------------------
-            curated = get_example_mapping_for(instrument_name, definition)
+            if st.session_state.get("_nxem_example_index") is None:
+                pairs = load_all_example_pairs_from_dir(EXAMPLE_MAPPINGS_DIR, definition_prefix="NXem")
+                st.session_state._nxem_example_index = build_example_index(pairs)
 
-            if curated:
-                st.success(
-                    f"Loaded curated example mapping for **{instrument_name} | {definition}** "
-                    f"from JSON file `{mapping_path_for(definition, instrument_name).name}`"
-                )
-                st.subheader("📘 Curated mapping (from example JSON)")
-                st.json(curated)
+            index = st.session_state._nxem_example_index
 
-                st.session_state.bulk_mapping_accepted = curated.copy()
-                st.session_state.bulk_mapping_rejected = {}
-                st.session_state.bulk_mapping_rawlog = {}
+            mapping_mode = st.radio(
+                "Mapping mode",
+                ["Hybrid (LLM only when uncertain)", "Deterministic (no LLM)", "LLM always"],
+                index=0,
+            )
+            st.caption(f"Deterministic thresholds: CONF_MIN={CONF_MIN}, LOGRATIO_MIN={LOGRATIO_MIN}")
 
-                if not st.button("♻️ Extend mapping with LLM (only for missing keys)"):
-                    st.stop()
-                else:
-                    st.info("Extending curated mapping with LLM for keys not covered in the example...")
+            # (unchanged) load curated/db mapping if present
+            accepted = {}
+            rejected = {}
+            raw_log = {}
 
-            else:
-                # ----------------------------------
-                # 2) If no curated mapping, try DB
-                # ----------------------------------
-                cached = _mapping_db_get(instrument_name, definition)
-                if cached and isinstance(cached.get("mapping"), dict):
-                    cached_map = cached["mapping"]
-                    valid_cached = cached_map
+            cached = _mapping_db_get(res.get("instrument_name", "unknown"), st.session_state.get("nexus_definition", "NXem"))
+            if cached and isinstance(cached.get("mapping"), dict):
+                accepted = cached.get("mapping") or {}
 
-                    st.success(
-                        f"Loaded mapping from local DB (mapping_db.json) for **{instrument_name} | {definition}**"
-                    )
-                    st.caption(f"Updated at: {cached.get('updated_at', '—')}")
-                    st.subheader("✅ Mapping (from DB)")
-                    st.json(valid_cached or {})
-
-                    st.session_state.bulk_mapping_accepted = valid_cached
-                    st.session_state.bulk_mapping_rejected = {}
-                    st.session_state.bulk_mapping_rawlog = {}
-
-                    if not st.button("♻️ Re-map with LLM (ignore cache)"):
-                        st.stop()
-                    else:
-                        st.info("Ignoring cache and re-mapping with LLM from scratch...")
-
-            # ----------------------------------
-            # 3) LLM-based mapping for remaining keys (with global examples)
-            # ----------------------------------
+            # Key selection
             meta_keys = flatten_metadata_keys(safe_md)
-
             st.caption("Choose how many keys to include (in order).")
             max_keys = st.slider(
                 "Number of keys to map",
@@ -968,18 +1157,31 @@ if workflow == "Upload image + metadata":
             show_rank_debug = st.checkbox("Show candidate ranking (debug)", value=False)
             st.caption(f"Per-key candidate paths (fixed): {PER_KEY_CANDIDATE_LIMIT}")
 
-            if st.button("🤖 Map ALL selected keys (LLM for missing ones)"):
-                accepted = dict(st.session_state.get("bulk_mapping_accepted", {}))
-                rejected = dict(st.session_state.get("bulk_mapping_rejected", {}))
-                raw_log = dict(st.session_state.get("bulk_mapping_rawlog", {}))
+            button_label = "🤖 Map ALL selected keys"
+            if mapping_mode == "Hybrid (LLM only when uncertain)":
+                button_label = "🤖 Map ALL selected keys (Hybrid: LLM only when uncertain)"
+            elif mapping_mode == "Deterministic (no LLM)":
+                button_label = "🤖 Map ALL selected keys (Deterministic: NO LLM)"
+            else:
+                button_label = "🤖 Map ALL selected keys (LLM always)"
 
-                md_snippet = (
-                    pretty_md if len(pretty_md) < 3000 else pretty_md[:3000] + "\n…(truncated)…"
-                )
+            if st.button(button_label):
+                accepted = dict(accepted or {})
+                rejected = dict(rejected or {})
+                raw_log = dict(raw_log or {})
+
+                # NEW: stash bucket for unmapped keys (A)
+                stashed: dict[str, dict] = {}
+
+                md_snippet = pretty_md if len(pretty_md) < 3000 else pretty_md[:3000] + "\n…(truncated)…"
 
                 progress = st.progress(0)
                 status = st.empty()
                 total_keys = len(keys_to_map)
+
+                det_used = 0
+                llm_used = 0
+                stashed_count = 0
 
                 for idx, key in enumerate(keys_to_map, start=1):
                     if key in accepted:
@@ -990,43 +1192,109 @@ if workflow == "Upload image + metadata":
                     value_preview = get_value_preview(safe_md, key)
                     sibling_keys = [k for k in keys_to_map if k != key]
 
-                    # --- global example pairs (from all instruments for this definition)
-                    example_pairs = get_example_pairs_for_key(definition, key, top_n=6)
-                    
-                    # NEW: show which example mappings are being used for this key
-                    if show_rank_debug and example_pairs:
-                        st.markdown(f"**{key} — example mappings used**")
-                        lines = [f'"{ex_key}" → "{ex_path}"' for ex_key, ex_path in example_pairs]
-                        st.code("\n".join(lines), language="text")
+                    # Try exact-key reuse from curated examples if present
+                    kl = key.strip().lower()
+                    exact_path = index.get("exact_key_map", {}).get(kl)
+                    if exact_path and exact_path in aps_list:
+                        # Minimal safety rule: stash encoding keys if mapping is outside safe zones
+                        if _should_stash_encoding_key(key, exact_path):
+                            stashed[key] = {"value_preview": value_preview, "reason": "encoding-key safety (exact-key)"}
+                            stashed_count += 1
+                        else:
+                            accepted[key] = exact_path
+                        progress.progress(idx / total_keys)
+                        continue
 
-                    # 1) exact-key reuse: if an example key matches exactly, and its path is allowed, reuse it
-                    exact_match = None
-                    key_l = key.lower()
-                    for ex_key, ex_path in example_pairs:
-                        if ex_key.lower() == key_l:
-                            exact_match = ex_path
-                            break
-
-                    if exact_match is not None:
-                        if exact_match in aps:
-                            accepted[key] = exact_match
-                            progress.progress(idx / total_keys)
-                            continue
-                        # if not in aps, we still pass it as example but don't auto-accept
-
-                    # 2) build candidate list via lexical ranking
-                    allowed_subset = prioritize_paths_lexical(
-                        allowed_paths=aps,
+                    # Deterministic proposal
+                    det = deterministic_pick_path(
+                        aps_list=aps_list,
+                        index=index,
+                        definition=st.session_state.get("nexus_definition", "NXem"),
                         key=key,
                         value_preview=value_preview,
                         sibling_keys=sibling_keys,
-                        definition=definition,
+                    )
+                    proposed_path = _canonicalize_example_path(_normalize_path(det["chosen"]))
+
+                    use_llm = False
+                    if mapping_mode == "LLM always":
+                        use_llm = True
+                    elif mapping_mode == "Deterministic (no LLM)":
+                        use_llm = False
+                    else:
+                        if det["confidence"] < CONF_MIN or det["log_ratio"] < LOGRATIO_MIN:
+                            use_llm = True
+
+                    if show_rank_debug:
+                        st.markdown(
+                            f"**{key} — deterministic** → `{proposed_path}` "
+                            f"(conf={det['confidence']:.2f}, log_ratio={det['log_ratio']:.2f}, "
+                            f"cluster={CLUSTERS[det['cluster_id']]['label']})"
+                        )
+                        st.code(json.dumps(det["candidates"], indent=2), language="json")
+
+                    # If NOT using LLM, accept/reject/stash now
+                    if not use_llm:
+                        det_used += 1
+
+                        # Minimal concrete suggestion: encoding-key safety guard
+                        if _should_stash_encoding_key(key, proposed_path):
+                            stashed[key] = {
+                                "value_preview": value_preview,
+                                "reason": "encoding-key safety (deterministic)",
+                                "proposed_path": proposed_path,
+                                "confidence": det["confidence"],
+                                "log_ratio": det["log_ratio"],
+                            }
+                            stashed_count += 1
+                            progress.progress(idx / total_keys)
+                            continue
+
+                        if proposed_path and proposed_path in aps_list:
+                            accepted[key] = proposed_path
+                            raw_log[key] = {
+                                "mode": "deterministic",
+                                "chosen": proposed_path,
+                                "confidence": det["confidence"],
+                                "log_ratio": det["log_ratio"],
+                                "cluster": det["cluster_id"],
+                            }
+                        else:
+                            # NEW: instead of just rejected, stash as unmapped (A)
+                            stashed[key] = {
+                                "value_preview": value_preview,
+                                "reason": "no valid path (deterministic)",
+                                "proposed_path": proposed_path,
+                                "confidence": det["confidence"],
+                                "log_ratio": det["log_ratio"],
+                            }
+                            stashed_count += 1
+                        progress.progress(idx / total_keys)
+                        continue
+
+                    # LLM fallback
+                    llm_used += 1
+                    cluster_id = det["cluster_id"]
+                    cluster_reason = det["cluster_reason"]
+
+                    scored_examples = pick_similar_examples(index, cluster_id, key, top_n=6)
+                    example_pairs = [(k, p) for (k, p, _) in scored_examples]
+
+                    cluster_paths = filter_paths_by_cluster(aps_list, cluster_id)
+                    cache_key = f"{st.session_state.get('nexus_definition','NXem')}::{cluster_id}"
+
+                    allowed_subset = prioritize_paths_lexical(
+                        allowed_paths=cluster_paths,
+                        key=key,
+                        value_preview=value_preview,
+                        sibling_keys=sibling_keys,
+                        cache_key=cache_key,
                         top_k=PER_KEY_CANDIDATE_LIMIT,
                         show_debug=show_rank_debug,
                     )
 
                     prompt = build_single_key_mapping_prompt(
-                        definition=definition,
+                        definition=st.session_state.get("nexus_definition", "NXem"),
                         selected_key=key,
                         value_preview=value_preview,
                         allowed_subset=allowed_subset,
@@ -1037,61 +1305,113 @@ if workflow == "Upload image + metadata":
                     try:
                         resp = query_ollama(prompt, model=selected_model)
                         raw_log[key] = resp
+                        if show_rank_debug:
+                            raw_log[f"{key}__cluster"] = {"cluster": cluster_id, "reason": cluster_reason}
+                            raw_log[f"{key}__examples"] = [
+                                {"key": ek, "path": ep, "score": s} for (ek, ep, s) in scored_examples
+                            ]
 
                         try:
                             parsed = extract_json_from_response(resp)
                         except Exception:
                             parsed = robust_json_from_text(resp)
 
-                        proposed_path = ""
+                        llm_path = ""
                         if isinstance(parsed, dict):
                             mapping_obj = parsed.get("mapping", {})
                             if isinstance(mapping_obj, dict):
                                 if key in mapping_obj and isinstance(mapping_obj[key], str):
-                                    proposed_path = mapping_obj[key]
+                                    llm_path = mapping_obj[key]
                                 else:
                                     for _, v in mapping_obj.items():
                                         if isinstance(v, str):
-                                            proposed_path = v
+                                            llm_path = v
                                             break
 
-                        proposed_path = _normalize_path(_canonicalize_example_path(proposed_path))
+                        llm_path = _canonicalize_example_path(_normalize_path(llm_path))
 
-                        if proposed_path and proposed_path in aps:
-                            accepted[key] = proposed_path
+                        # Minimal concrete suggestion: encoding-key safety guard
+                        if _should_stash_encoding_key(key, llm_path):
+                            stashed[key] = {
+                                "value_preview": value_preview,
+                                "reason": "encoding-key safety (LLM)",
+                                "proposed_path": llm_path,
+                            }
+                            stashed_count += 1
+                        elif llm_path and llm_path in aps_list:
+                            accepted[key] = llm_path
                         else:
-                            rejected[key] = proposed_path
+                            # NEW: stash instead of plain reject (A)
+                            stashed[key] = {
+                                "value_preview": value_preview,
+                                "reason": "no valid path (LLM)",
+                                "proposed_path": llm_path,
+                            }
+                            stashed_count += 1
 
                     except Exception as e:
-                        raw_log[key] = f"ERROR: {e}"
-                        rejected[key] = ""
+                        stashed[key] = {"value_preview": value_preview, "reason": f"LLM error: {e}"}
+                        stashed_count += 1
 
                     progress.progress(idx / total_keys)
 
                 status.empty()
+                st.info(f"Deterministic used: {det_used} keys | LLM used: {llm_used} keys | Stashed: {stashed_count} keys")
 
-                st.subheader("✅ Accepted (valid / curated + examples + LLM)")
+                st.subheader("✅ Accepted (valid mappings)")
                 st.json(accepted or {})
 
-                st.subheader("⚠️ Rejected or empty (review needed)")
-                st.json(rejected or {})
+                # Keep a small rejected bucket for transparency, but prefer stash
+                st.subheader("📦 Stashed (unmapped or unsafe-to-map) — schema-valid preservation")
+                if not stashed:
+                    st.success("No stashed keys — everything mapped cleanly.")
+                else:
+                    st.write(
+                        "These keys were not mapped to a specific ontology path (or were prevented by the safety rule). "
+                        "They will be preserved as a JSON blob in an existing NXDL field."
+                    )
+                    st.json(stashed)
+
+                    # Show the JSON blob the user should write later
+                    stash_field = st.session_state.get("_stash_field_path", "")
+                    st.markdown("**Recommended stash field (must exist in NXDL):**")
+                    st.code(stash_field or "(not found automatically)", language="text")
+
+                    # Build blob from original values when possible (not just previews)
+                    # Note: safe_md can be nested; if key is dotted, we show preview only here.
+                    # If your keys are not dotted, you can use safe_md.get(key).
+                    blob = {
+                        "stashed_at": datetime.now(timezone.utc).isoformat(),
+                        "definition": st.session_state.get("nexus_definition", "NXem"),
+                        "instrument": res.get("instrument_name", "unknown"),
+                        "keys": {k: stashed[k].get("value_preview", "") for k in stashed.keys()},
+                    }
+                    blob_text = json.dumps(blob, indent=2, ensure_ascii=False)
+                    st.markdown("**JSON blob to store at the stash field:**")
+                    st.code(blob_text[:12000] + ("\n…(truncated)…" if len(blob_text) > 12000 else ""), language="json")
+
+                    # Optional: store a special mapping entry so downstream knows where to write the blob
+                    if stash_field:
+                        accepted_with_stash = dict(accepted)
+                        accepted_with_stash["__UNMAPPED_METADATA_JSON__"] = stash_field
+
+                        with st.expander("Optional: include stash field in mapping output"):
+                            st.write(
+                                "If you want the mapping output itself to indicate where to store unmapped metadata, "
+                                "use this version:"
+                            )
+                            st.json(accepted_with_stash)
 
                 with st.expander("LLM raw responses per key (debug)"):
                     st.code(json.dumps(raw_log, indent=2), language="json")
 
-                st.session_state.bulk_mapping_accepted = accepted
-                st.session_state.bulk_mapping_rejected = rejected
-                st.session_state.bulk_mapping_rawlog = raw_log
-
+                # Persist accepted mapping only (clean output)
+                instrument_name = res.get("instrument_name", "unknown")
+                definition = st.session_state.get("nexus_definition", "NXem")
                 if accepted:
-                    _mapping_db_put(instrument_name, definition, accepted)
-                    st.success(
-                        f"Saved mapping to DB for **{instrument_name} | {definition}** → mapping_db.json"
-                    )
+                    _mapping_db_put(instrument_name, definition, accepted, mapping_full=None)
+                    st.success(f"Saved mapping to DB for **{instrument_name} | {definition}** → mapping_db.json")
 
-# ==============================
-# Other workflow placeholder
-# ==============================
 else:
     st.info("This workflow will be implemented in a later step. For now, use ‘Upload image + metadata’.")
 
