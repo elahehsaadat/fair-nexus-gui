@@ -2,8 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.git/
 .venv/
-.env/
+.env
+.pytest_cache/
 *.log
 *.bak
 .DS_Store

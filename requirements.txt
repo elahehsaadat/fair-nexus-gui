@@ -38,7 +38,6 @@ numpy==1.26.4
 nxvalidate==0.3.5b3
 packaging==25.0
 pandas==2.2.2
-paramiko==3.5.1
 Pillow==11.2.1
 Pint==0.24.4
 platformdirs==4.3.8
@@ -71,4 +70,3 @@ urllib3==2.4.0
 watchdog==6.0.0
 xarray==2025.6.1
 zipp==3.23.0
-tinydb>=4.8.0
