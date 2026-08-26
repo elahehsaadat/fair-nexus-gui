@@ -9,9 +9,7 @@ import re
 from PIL import Image
 import os
 import json
-import paramiko
 import string
-from urllib.parse import urlparse
 
 # =========================
 # Helpers: parse vendor blobs (bytes/text) into key=value dict
@@ -108,29 +106,7 @@ def _summarize_bytes(blob: bytes, max_preview: int = 200) -> str:
         txt = txt[:max_preview] + "…"
     return f"<bytes length={len(blob)} preview='{txt}'>"
 
-# === File transfer ===
-def send_file_sftp(local_path, remote_uri):
-    parsed = urlparse(remote_uri)
-    transport = paramiko.Transport((parsed.hostname, 22))
-    transport.connect(username=parsed.username)
-    sftp = paramiko.SFTPClient.from_transport(transport)
-    sftp.put(local_path, parsed.path)
-    sftp.close()
-    transport.close()
-    print(f"📤 File uploaded to {remote_uri}")
-
-def send_file_http(local_path, url):
-    with open(local_path, "rb") as f:
-        res = requests.post(url, files={"file": f})
-    print(f"📤 Uploaded to {url}, status code: {res.status_code}")
-
 # === Utilities ===
-def fix_common_json_errors(json_str: str) -> str:
-    json_str = re.sub(r'("\s*:\s*[^,{}\[\]\n"]+)(\s*")', r"\1,\2", json_str)
-    json_str = re.sub(r"(\})(\s*\{)", r"\1,\2", json_str)
-    json_str = re.sub(r'(?<=\{|,)\s*(\w+)\s*:', r'"\1":', json_str)
-    return json_str
-
 def extract_json_from_response(text) -> dict:
     if isinstance(text, dict):
         return text
@@ -307,14 +283,18 @@ def extract_metadata_from_tiff(uploaded_file) -> dict:
                     # Handle bytes blobs: summarize + parse KV
                     if isinstance(value, (bytes, bytearray)):
                         blob = bytes(value)
-                        meta[name] = _summarize_bytes(blob)
-
                         kv = _parse_kv_from_bytes(blob)
                         if kv:
                             _merge_kv(vendor_kv, kv)
                             vendor_sources.append(
                                 {"tag": name, "page": page_i, "kind": "bytes", "kv_count": len(kv)}
                             )
+
+                        # TESCAN tag 50431 is a binary container. Map its parsed
+                        # VendorKV fields, not the raw JPEG 2000/INI payload.
+                        is_tescan_container = getattr(tag, "code", None) == 50431
+                        if not (is_tescan_container and kv):
+                            meta[name] = _summarize_bytes(blob)
 
                     # Handle text blobs that look like KV blocks (some vendors use ImageDescription etc.)
                     elif isinstance(value, str):
@@ -342,11 +322,3 @@ def extract_metadata_from_json_header(file) -> dict:
         return json.loads(content)
     except Exception:
         return {}
-
-def build_standard_metadata(mapping: dict, metadata: dict) -> dict:
-    result = {}
-    for source_key, target_key in mapping.items():
-        value = metadata.get(source_key)
-        if value not in (None, ""):
-            result[target_key] = value
-    return result

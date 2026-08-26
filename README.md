@@ -1,16 +1,15 @@
 # FAIR NeXus GUI Assistant
 
-A Streamlit application for extracting microscopy-image metadata, mapping it to
-NeXus definitions, and generating FAIR NeXus files. Model-assisted features use
-the ORFEO LLM gateway.
+A Streamlit application for extracting microscopy-image metadata and mapping it
+to NeXus definitions. Model-assisted features use the ORFEO LLM gateway.
 
 ## Features
 
 - Upload TIFF, PNG, or JPEG microscopy images.
 - Extract embedded TIFF metadata or load a separate JSON header.
-- Select a NeXus application definition and map metadata fields.
-- Generate, validate, and download a NeXus file.
-- Use an ORFEO-hosted language model to assist with metadata interpretation.
+- Use an ORFEO-hosted language model to identify the instrument and experiment.
+- Select a NeXus application definition and map metadata keys to valid paths.
+- Preserve unmapped metadata in a schema-valid stash and save reusable mappings.
 
 ## Requirements
 
@@ -95,9 +94,8 @@ docker run --rm -p 8501:8501 --env-file .env fair-nexus-gui
 ## Project layout
 
 - `nexus_gui.py`: Streamlit interface and workflow
-- `nexus_generator.py`: NeXus file generation and validation
 - `upload_utils.py`: image, metadata, ORFEO, and upload helpers
-- `mapping_store.py`: saved mapping persistence
+- `mapping_db.json`: saved reusable mappings
 - `nexus_definitions/`: pinned NeXus definitions Git submodule
 - `tests/`: regression tests
 

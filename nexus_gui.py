@@ -39,6 +39,18 @@ APP_DIRS = [DEF_ROOT / "applications", DEF_ROOT / "contributed_definitions"]
 
 EXAMPLE_MAPPINGS_DIR = BASE_DIR / "example_mappings"
 
+NON_MAPPABLE_ROOT_KEYS = {
+    "50431",  # TESCAN binary metadata container; VendorKV holds parsed fields.
+    "BitsPerSample",
+    "Compression",
+    "Orientation",
+    "PlanarConfiguration",
+    "RowsPerStrip",
+    "StripByteCounts",
+    "StripOffsets",
+    "VendorKV_sources",
+}
+
 # -----------------------------------------
 # (A) General fallback “stash” for unmapped metadata
 # -----------------------------------------
@@ -384,6 +396,12 @@ def _key_tokens_for_cluster(key: str) -> set[str]:
     return set(_tok(k))
 
 
+def _metadata_key_aliases(key: str) -> tuple[str, ...]:
+    full_key = str(key).strip().lower()
+    leaf_key = full_key.rsplit(".", 1)[-1]
+    return tuple(dict.fromkeys((full_key, leaf_key)))
+
+
 def similarity_score_tokens(q_tokens: set[str], ex_tokens: set[str]) -> float:
     if not q_tokens or not ex_tokens:
         return 0.0
@@ -413,7 +431,7 @@ def load_all_example_pairs_from_dir(example_dir: Path, definition_prefix: str = 
     pairs: list[tuple[str, str]] = []
     if not example_dir.exists():
         return pairs
-    for p in example_dir.glob(f"{definition_prefix}__*.json"):
+    for p in example_dir.glob(f"{definition_prefix}_*.json"):
         try:
             raw = json.load(open(p, "r", encoding="utf-8"))
             if not isinstance(raw, dict):
@@ -454,9 +472,9 @@ def build_example_index(example_pairs: list[tuple[str, str]]) -> dict:
 
 
 def route_cluster(index: dict, key: str) -> tuple[str, str]:
-    kl = key.strip().lower()
-    if kl in index.get("key_to_cluster", {}):
-        return index["key_to_cluster"][kl], "exact-key (examples)"
+    for alias in _metadata_key_aliases(key):
+        if alias in index.get("key_to_cluster", {}):
+            return index["key_to_cluster"][alias], "exact-key (examples)"
     c_hint = _example_cluster_from_key(key)
     if c_hint:
         return c_hint, "key-hints"
@@ -464,7 +482,7 @@ def route_cluster(index: dict, key: str) -> tuple[str, str]:
 
 
 def pick_similar_examples(index: dict, cluster_id: str, key: str, top_n: int = 6) -> list[tuple[str, str, float]]:
-    q_tokens = _key_tokens_for_cluster(key)
+    q_tokens = _key_tokens_for_cluster(_metadata_key_aliases(key)[-1])
     candidates = index.get("cluster_examples", {}).get(cluster_id, [])
     scored: list[tuple[str, str, float]] = []
     for ex_key, ex_path in candidates:
@@ -740,6 +758,8 @@ def flatten_metadata_keys(data, parent=""):
     keys = []
     if isinstance(data, dict):
         for k, v in data.items():
+            if not parent and str(k) in NON_MAPPABLE_ROOT_KEYS:
+                continue
             path = f"{parent}.{k}" if parent else k
             keys.extend(flatten_metadata_keys(v, path))
     elif isinstance(data, list):
@@ -749,16 +769,18 @@ def flatten_metadata_keys(data, parent=""):
     return list(dict.fromkeys(keys))
 
 
+def get_metadata_value(data: dict, dotted_key: str):
+    node = data
+    for part in dotted_key.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
 def get_value_preview(data: dict, dotted_key: str, max_len: int = 240) -> str:
     try:
-        node = data
-        for part in dotted_key.split("."):
-            if isinstance(node, dict):
-                node = node.get(part, None)
-            else:
-                node = None
-                break
-        s = repr(node)
+        s = repr(get_metadata_value(data, dotted_key))
     except Exception:
         s = "None"
     s = "None" if s is None else str(s)
@@ -951,24 +973,30 @@ def _mapping_db_put(
 # App UI
 # =========================================
 load_dotenv()
-LOGO_NFFA = "https://raw.githubusercontent.com/elahehsaadat/fair-nexus-gui/main/assets/nffa.png"
-LOGO_LADE = "https://raw.githubusercontent.com/elahehsaadat/fair-nexus-gui/main/assets/area.png"
+LOGO_NFFA = Path(__file__).parent / "assets" / "nffa.png"
+LOGO_LADE = Path(__file__).parent / "assets" / "area.png"
 
-st.set_page_config(page_title="FAIR NeXus File Metadata Assistant — Step 1 + Mapping (beta)", layout="centered")
+st.set_page_config(page_title="FAIR NeXus Metadata Mapper", layout="centered")
 
 with st.sidebar:
     st.image(LOGO_NFFA, caption="NFFA-DI")
     st.image(LOGO_LADE, caption="AREA Science Park")
 
-st.title("🔬 FAIR NeXus Assistant — Step 1 + Mapping (beta)")
-st.caption("Upload → preview → extract metadata → instrument/experiment via LLM → select NXDL → map keys to NeXus paths.")
+st.title("🔬 FAIR NeXus Metadata Mapper")
+st.caption(
+    "Upload a microscopy image, extract metadata, select an NXDL definition, "
+    "and map metadata keys to NeXus paths."
+)
 
 models = get_ollama_models()
 if not models:
-    st.error("⚠️ No models found. Start one on your Ollama host, then refresh.")
+    st.error(
+        "⚠️ No ORFEO models are available. Check your credentials and gateway "
+        "connection, then refresh."
+    )
     st.stop()
 
-selected_model = st.selectbox("LLM model served by Ollama", models)
+selected_model = st.selectbox("ORFEO LLM model", models)
 workflow = st.radio("Choose a workflow", ["Upload image + metadata", "Reference a stack (folder / S3 URL)"])
 
 if "meta" not in st.session_state:
@@ -1172,6 +1200,7 @@ if workflow == "Upload image + metadata":
 
                 # NEW: stash bucket for unmapped keys (A)
                 stashed: dict[str, dict] = {}
+                stash_field = st.session_state.get("_stash_field_path", "")
 
                 md_snippet = pretty_md if len(pretty_md) < 3000 else pretty_md[:3000] + "\n…(truncated)…"
 
@@ -1182,9 +1211,13 @@ if workflow == "Upload image + metadata":
                 det_used = 0
                 llm_used = 0
                 stashed_count = 0
+                reused_count = 0
+                curated_used = 0
+                newly_mapped_count = 0
 
                 for idx, key in enumerate(keys_to_map, start=1):
                     if key in accepted:
+                        reused_count += 1
                         progress.progress(idx / total_keys)
                         continue
 
@@ -1193,15 +1226,23 @@ if workflow == "Upload image + metadata":
                     sibling_keys = [k for k in keys_to_map if k != key]
 
                     # Try exact-key reuse from curated examples if present
-                    kl = key.strip().lower()
-                    exact_path = index.get("exact_key_map", {}).get(kl)
+                    exact_path = next(
+                        (
+                            index.get("exact_key_map", {}).get(alias)
+                            for alias in _metadata_key_aliases(key)
+                            if index.get("exact_key_map", {}).get(alias)
+                        ),
+                        None,
+                    )
                     if exact_path and exact_path in aps_list:
+                        curated_used += 1
                         # Minimal safety rule: stash encoding keys if mapping is outside safe zones
                         if _should_stash_encoding_key(key, exact_path):
                             stashed[key] = {"value_preview": value_preview, "reason": "encoding-key safety (exact-key)"}
                             stashed_count += 1
                         else:
                             accepted[key] = exact_path
+                            newly_mapped_count += 1
                         progress.progress(idx / total_keys)
                         continue
 
@@ -1252,6 +1293,7 @@ if workflow == "Upload image + metadata":
 
                         if proposed_path and proposed_path in aps_list:
                             accepted[key] = proposed_path
+                            newly_mapped_count += 1
                             raw_log[key] = {
                                 "mode": "deterministic",
                                 "chosen": proposed_path,
@@ -1340,6 +1382,7 @@ if workflow == "Upload image + metadata":
                             stashed_count += 1
                         elif llm_path and llm_path in aps_list:
                             accepted[key] = llm_path
+                            newly_mapped_count += 1
                         else:
                             # NEW: stash instead of plain reject (A)
                             stashed[key] = {
@@ -1355,8 +1398,23 @@ if workflow == "Upload image + metadata":
 
                     progress.progress(idx / total_keys)
 
+                stash_payload = {
+                    key: {
+                        **details,
+                        "value": make_json_safe(get_metadata_value(safe_md, key)),
+                    }
+                    for key, details in stashed.items()
+                }
+
                 status.empty()
-                st.info(f"Deterministic used: {det_used} keys | LLM used: {llm_used} keys | Stashed: {stashed_count} keys")
+                st.info(
+                    f"Selected: {total_keys} | Reused: {reused_count} | "
+                    f"Newly mapped: {newly_mapped_count} | Stashed: {stashed_count}"
+                )
+                st.caption(
+                    f"Methods — curated: {curated_used}, deterministic: {det_used}, "
+                    f"LLM attempted: {llm_used}"
+                )
 
                 st.subheader("✅ Accepted (valid mappings)")
                 st.json(accepted or {})
@@ -1373,7 +1431,6 @@ if workflow == "Upload image + metadata":
                     st.json(stashed)
 
                     # Show the JSON blob the user should write later
-                    stash_field = st.session_state.get("_stash_field_path", "")
                     st.markdown("**Recommended stash field (must exist in NXDL):**")
                     st.code(stash_field or "(not found automatically)", language="text")
 
@@ -1384,7 +1441,7 @@ if workflow == "Upload image + metadata":
                         "stashed_at": datetime.now(timezone.utc).isoformat(),
                         "definition": st.session_state.get("nexus_definition", "NXem"),
                         "instrument": res.get("instrument_name", "unknown"),
-                        "keys": {k: stashed[k].get("value_preview", "") for k in stashed.keys()},
+                        "keys": {k: stash_payload[k]["value"] for k in stashed},
                     }
                     blob_text = json.dumps(blob, indent=2, ensure_ascii=False)
                     st.markdown("**JSON blob to store at the stash field:**")
@@ -1405,12 +1462,19 @@ if workflow == "Upload image + metadata":
                 with st.expander("LLM raw responses per key (debug)"):
                     st.code(json.dumps(raw_log, indent=2), language="json")
 
-                # Persist accepted mapping only (clean output)
+                # Persist accepted mappings and full values for keys that need a stash.
                 instrument_name = res.get("instrument_name", "unknown")
                 definition = st.session_state.get("nexus_definition", "NXem")
-                if accepted:
-                    _mapping_db_put(instrument_name, definition, accepted, mapping_full=None)
-                    st.success(f"Saved mapping to DB for **{instrument_name} | {definition}** → mapping_db.json")
+                if accepted or stashed:
+                    mapping_full = {
+                        "stash_field": stash_field,
+                        "stashed": stash_payload,
+                    }
+                    _mapping_db_put(instrument_name, definition, accepted, mapping_full=mapping_full)
+                    st.success(
+                        f"Saved mappings and stashed metadata for "
+                        f"**{instrument_name} | {definition}** → mapping_db.json"
+                    )
 
 else:
     st.info("This workflow will be implemented in a later step. For now, use ‘Upload image + metadata’.")
