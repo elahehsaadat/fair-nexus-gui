@@ -1,0 +1,40 @@
+{
+  "reference_type": "curated_metadata_baseline",
+  "reference_status": "Not an authoritative NeXus output",
+  "image_path": "benchmark/nxem/fei_helios/FEI-Helios-Ebeam-16bits.tif",
+  "target_definition": "NXem",
+  "provenance": {
+    "source_repository": "https://github.com/hyperspy/rosettasciio",
+    "source_commit": "bc254db14cd7d4d23169b11aeb622a0a7eac1fbe",
+    "source_archive": "rsciio/tests/data/tiff/tiff_FEI_Helios.zip",
+    "upstream_repository_license": "GPL-3.0"
+  },
+  "verified_metadata": {
+    "image_width_px": 512,
+    "image_height_px": 471,
+    "bit_depth": 16,
+    "instrument_vendor": "FEI",
+    "instrument_model": "Helios NanoLab 660",
+    "instrument_model_raw": "Helios NanoLab\" 660",
+    "instrument_type": "DualBeam",
+    "electron_source": "FEG",
+    "detector": "ETD",
+    "acceleration_voltage": {
+      "value": 5000,
+      "unit": "V"
+    },
+    "acquisition_date": "2016-06-13",
+    "acquisition_time": "17:06:40",
+    "instrument_software": "5.5.1.3318"
+  },
+  "current_app_extraction": {
+    "vendor_container": "FEI_HELIOS",
+    "vendor_container_present": true,
+    "top_level_key_count": 15,
+    "vendor_tag_decoded": true
+  },
+  "reference_limitations": [
+    "Values are curated from embedded TIFF tags, not from an independently published NXem file.",
+    "Use this file to verify parsing and semantic mapping inputs; do not score it as path-level NeXus ground truth."
+  ]
+}

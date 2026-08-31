@@ -1,0 +1,46 @@
+{
+  "reference_type": "curated_metadata_baseline",
+  "reference_status": "Not an authoritative NeXus output",
+  "image_path": "benchmark/nxem/zeiss_sem/test_tiff_Zeiss_SEM_512pix.tif",
+  "target_definition": "NXem",
+  "provenance": {
+    "source_repository": "https://github.com/hyperspy/rosettasciio",
+    "source_commit": "bc254db14cd7d4d23169b11aeb622a0a7eac1fbe",
+    "source_archive": "rsciio/tests/data/tiff/tiff_Zeiss_SEM.zip",
+    "upstream_repository_license": "GPL-3.0"
+  },
+  "verified_metadata": {
+    "image_width_px": 512,
+    "image_height_px": 384,
+    "bit_depth": 8,
+    "instrument_vendor": "ZEISS",
+    "instrument_model": "ULTRA 55",
+    "instrument_serial_raw": "ULTRA 55-36-06",
+    "detector": "InLens",
+    "acceleration_voltage": {
+      "value": 5.0,
+      "unit": "kV"
+    },
+    "working_distance": {
+      "value": 3.9,
+      "unit": "mm"
+    },
+    "pixel_size": {
+      "value": 5.825,
+      "unit": "nm"
+    },
+    "magnification_raw": "50.00 K X",
+    "acquisition_date": "2018-09-25",
+    "acquisition_time_raw": "8:20:42"
+  },
+  "current_app_extraction": {
+    "vendor_container": "CZ_SEM",
+    "vendor_container_present": true,
+    "top_level_key_count": 15,
+    "vendor_tag_decoded": true
+  },
+  "reference_limitations": [
+    "Values are curated from embedded TIFF tags, not from an independently published NXem file.",
+    "Use this file to verify parsing and semantic mapping inputs; do not score it as path-level NeXus ground truth."
+  ]
+}

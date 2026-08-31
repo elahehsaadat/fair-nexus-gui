@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "description": "Small heterogeneous benchmark for evaluating metadata-to-NeXus path mapping.",
+  "source_snapshots": {
+    "pynxtools_xps": {
+      "repository": "https://github.com/FAIRmat-NFDI/pynxtools-xps",
+      "commit": "f7eefa1a454507482ac3408cd11793c83fe4edd9",
+      "license": "Apache-2.0"
+    },
+    "pynxtools_raman": {
+      "repository": "https://github.com/FAIRmat-NFDI/pynxtools-raman",
+      "commit": "79a7a4ec1459b8520c0c31b954016937884b81f9",
+      "license": "Apache-2.0"
+    },
+    "rosettasciio": {
+      "repository": "https://github.com/hyperspy/rosettasciio",
+      "commit": "bc254db14cd7d4d23169b11aeb622a0a7eac1fbe",
+      "license": "GPL-3.0"
+    }
+  },
+  "cases": [
+    {
+      "id": "nxem_tescan_amber_x",
+      "technique": "electron_microscopy",
+      "target_definition": "NXem",
+      "vendor_or_format": "TESCAN AMBER X TIFF",
+      "input_path": "benchmark/nxem/tescan/lamella attached FIB.tif",
+      "input_sha256": "0f479414f491a1273a16d7e8fc14ac22828a77fb2531b43a358896833edcd8f6",
+      "reference_path": "benchmark/nxem/tescan/reference.json",
+      "reference_sha256": "579bf53dbad4cb875a19a2354a2a7ca6d8f298a66c0bff82d148973d83d0ca88",
+      "reference_type": "curated_metadata_baseline",
+      "source": "Existing repository sample_data file",
+      "source_url": null
+    },
+    {
+      "id": "nxem_fei_helios",
+      "technique": "electron_microscopy",
+      "target_definition": "NXem",
+      "vendor_or_format": "FEI Helios TIFF",
+      "input_path": "benchmark/nxem/fei_helios/FEI-Helios-Ebeam-16bits.tif",
+      "input_sha256": "d50b936714a2ef2c2ebf4afa8b33526970e24097c1934e5a51681fe262b88255",
+      "reference_path": "benchmark/nxem/fei_helios/reference.json",
+      "reference_sha256": "5749ce6c30c5256da9803029e5c1b26e4cf796b96ada4722e27972768c06c86c",
+      "reference_type": "curated_metadata_baseline",
+      "source": "rosettasciio",
+      "source_url": "https://github.com/hyperspy/rosettasciio/blob/bc254db14cd7d4d23169b11aeb622a0a7eac1fbe/rsciio/tests/data/tiff/tiff_FEI_Helios.zip"
+    },
+    {
+      "id": "nxem_zeiss_sem",
+      "technique": "electron_microscopy",
+      "target_definition": "NXem",
+      "vendor_or_format": "ZEISS SEM TIFF",
+      "input_path": "benchmark/nxem/zeiss_sem/test_tiff_Zeiss_SEM_512pix.tif",
+      "input_sha256": "3ff2ed5eb9fc1e75cf2188bd4aa11bba1cc82496e1084303bc8685aa1de99431",
+      "reference_path": "benchmark/nxem/zeiss_sem/reference.json",
+      "reference_sha256": "c485d004485a51bd12a04ba880797ee2d9ba66321d2cf26d1a5e2bad752fbe03",
+      "reference_type": "curated_metadata_baseline",
+      "source": "rosettasciio",
+      "source_url": "https://github.com/hyperspy/rosettasciio/blob/bc254db14cd7d4d23169b11aeb622a0a7eac1fbe/rsciio/tests/data/tiff/tiff_Zeiss_SEM.zip"
+    },
+    {
+      "id": "nxxps_specs_pbttt",
+      "technique": "xps",
+      "target_definition": "NXxps",
+      "vendor_or_format": "SPECS XML",
+      "input_path": "benchmark/nxxps/specs/In-situ_PBTTT_XPS_SPECS.xml",
+      "input_sha256": "3902052bb433169eef3860c0759c1fc2ae9b2b0104bad947741bedfcbb26339a",
+      "reference_path": "benchmark/nxxps/specs/specs_xml_ref.nxs",
+      "reference_sha256": "ae7984fc7dc49b40259e27d7e5b1533c1583b80ee4b81c1806337234fe2f7a41",
+      "reference_type": "reference_nexus_output",
+      "source": "pynxtools_xps",
+      "source_url": "https://github.com/FAIRmat-NFDI/pynxtools-xps/tree/f7eefa1a454507482ac3408cd11793c83fe4edd9/tests/data/specs_xml"
+    },
+    {
+      "id": "nxxps_phi_sno2",
+      "technique": "xps",
+      "target_definition": "NXxps",
+      "vendor_or_format": "PHI SPE",
+      "input_path": "benchmark/nxxps/phi/SnO2_10nm.spe",
+      "input_sha256": "506972306d578078c511588381b596dc51dc592020e2ad495b412ad9aa6c6ab1",
+      "reference_path": "benchmark/nxxps/phi/phi_spe_ref.nxs",
+      "reference_sha256": "0523ae04f3d5f130002d55d3c9bd8125ad72c2ca1acb64d97d05f5434ce3a2ca",
+      "reference_type": "reference_nexus_output",
+      "source": "pynxtools_xps",
+      "source_url": "https://github.com/FAIRmat-NFDI/pynxtools-xps/tree/f7eefa1a454507482ac3408cd11793c83fe4edd9/tests/data/phi_spe"
+    },
+    {
+      "id": "nxraman_rod_1000679",
+      "technique": "raman_spectroscopy",
+      "target_definition": "NXraman",
+      "vendor_or_format": "ROD",
+      "input_path": "benchmark/nxraman/rod/rod_file_1000679.rod",
+      "input_sha256": "d2e3c0b71c235b606f35fd01631d4d1cb31f5a8f178fe81d8412c39950399e65",
+      "reference_path": "benchmark/nxraman/rod/rod_ref.nxs",
+      "reference_sha256": "11e4f9b0dff363322dd6492301501f48d88bdb8abc4d013afa5206fdfd04aa29",
+      "reference_type": "reference_nexus_output",
+      "source": "pynxtools_raman",
+      "source_url": "https://github.com/FAIRmat-NFDI/pynxtools-raman/tree/79a7a4ec1459b8520c0c31b954016937884b81f9/tests/data/rod"
+    },
+    {
+      "id": "nxraman_witec_si_wafer",
+      "technique": "raman_spectroscopy",
+      "target_definition": "NXraman",
+      "vendor_or_format": "WITec text",
+      "input_path": "benchmark/nxraman/witec/Si-wafer-Raman-Spectrum-1.txt",
+      "input_sha256": "fe2bfe7cdda6d74adaf892322745d38b437d685ad9c49cf750d359b8f4cae5c0",
+      "reference_path": "benchmark/nxraman/witec/witec_ref.nxs",
+      "reference_sha256": "d17f3e73739173b9f697420f0a94deb43bae9f40da9a90286b7a289504171186",
+      "reference_type": "reference_nexus_output",
+      "source": "pynxtools_raman",
+      "source_url": "https://github.com/FAIRmat-NFDI/pynxtools-raman/tree/79a7a4ec1459b8520c0c31b954016937884b81f9/tests/data/witec"
+    }
+  ]
+}
