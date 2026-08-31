@@ -1,7 +1,7 @@
 {
   "reference_type": "curated_metadata_baseline",
   "reference_status": "Not an authoritative NeXus output",
-  "image_path": "benchmark/nxem/tescan/lamella attached FIB.tif",
+  "image_path": "benchmark/tiff_by_technique/sem/tescan/lamella attached FIB.tif",
   "target_definition": "NXem",
   "provenance": {
     "source": "Existing repository sample_data/lamella attached FIB.tif",

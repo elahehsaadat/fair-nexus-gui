@@ -1,0 +1,2 @@
+# Preserve downloaded scientific fixtures byte-for-byte.
+benchmark/tiff_by_technique/afm/*_source_profile.txt binary

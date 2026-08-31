@@ -1,7 +1,7 @@
 {
   "reference_type": "curated_metadata_baseline",
   "reference_status": "Not an authoritative NeXus output",
-  "image_path": "benchmark/nxem/zeiss_sem/test_tiff_Zeiss_SEM_512pix.tif",
+  "image_path": "benchmark/tiff_by_technique/sem/zeiss_sem/test_tiff_Zeiss_SEM_512pix.tif",
   "target_definition": "NXem",
   "provenance": {
     "source_repository": "https://github.com/hyperspy/rosettasciio",

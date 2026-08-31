@@ -1,0 +1,44 @@
+{
+  "reference_type": "source_backed_image_baseline",
+  "reference_status": "Derived Raman-map image, not raw spectra or an authoritative NeXus output",
+  "image_path": "benchmark/tiff_by_technique/raman_microscopy/flake_10_rescaled_raman.tif",
+  "technique": "raman_microscopy",
+  "target_definition": "NXraman",
+  "data_role": "Rescaled Raman map derived from graphene spectral peak areas",
+  "provenance": {
+    "repository": "https://github.com/ORead15/2DM-Anticounterfeiting",
+    "commit": "ccee018ca2b48160707ab5c0e852134e45f6744c",
+    "license": "Apache-2.0",
+    "upstream_path": "Raman Maps and OM Images/Rescaled Raman/Flake 10.tif",
+    "source_mapping_data": "Streamline Raman data/Flake 10.txt",
+    "processing_script": "Resize Raman contours to OM contours.py",
+    "authors": [
+      "Oliver Read",
+      "Khaled Parvez",
+      "Matthew Boyes",
+      "Xiuju Song",
+      "Jingjing Wang",
+      "Gianluca Fiora",
+      "Cinzia Casiraghi"
+    ]
+  },
+  "verified_file_metadata": {
+    "image_width_px": 59,
+    "image_height_px": 69,
+    "channels": 3,
+    "sample_type": "uint8",
+    "page_count": 1,
+    "photometric_interpretation": "RGB",
+    "compression": "LZW"
+  },
+  "current_app_extraction": {
+    "top_level_key_count": 12,
+    "vendor_container_present": false,
+    "result": "Generic TIFF fields only"
+  },
+  "reference_limitations": [
+    "The technique label and derivation are established by the source repository, not inferred from the TIFF extension.",
+    "This TIFF is a derived Raman map and does not contain the original spectrum at each pixel.",
+    "Use it to test TIFF ingestion and provenance handling, not spectral metadata extraction or path-level NXraman accuracy."
+  ]
+}

@@ -1,7 +1,7 @@
 {
   "reference_type": "curated_metadata_baseline",
   "reference_status": "Not an authoritative NeXus output",
-  "image_path": "benchmark/nxem/fei_helios/FEI-Helios-Ebeam-16bits.tif",
+  "image_path": "benchmark/tiff_by_technique/sem/fei_helios/FEI-Helios-Ebeam-16bits.tif",
   "target_definition": "NXem",
   "provenance": {
     "source_repository": "https://github.com/hyperspy/rosettasciio",
