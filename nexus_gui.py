@@ -4,6 +4,7 @@ import json
 import os
 import re
 import math
+import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
 import xml.etree.ElementTree as ET
@@ -20,6 +21,7 @@ from upload_utils import (
     extract_metadata_from_json_header,
     make_json_safe,
     extract_json_from_response,
+    build_nexus_file,
 )
 
 # =========================================
@@ -870,8 +872,6 @@ def _collect_paths_from_xml_group(g: ET.Element, parent: str = "") -> set[str]:
     paths: set[str] = set()
     label = _group_label(g)
     curr = f"{parent}/{label}" if (parent and label) else (label or parent)
-    if curr:
-        paths.add(curr)
     for child in g:
         tag = _strip_ns(child.tag).lower()
         if tag == "group":
@@ -937,6 +937,7 @@ def _mapping_db_save(db: dict) -> None:
     try:
         with open(MAPPING_DB_PATH, "w", encoding="utf-8") as f:
             json.dump(db, f, indent=2, ensure_ascii=False)
+            f.write("\n")
     except Exception as e:
         st.warning(f"Could not save mapping DB: {e}")
 
@@ -1026,6 +1027,20 @@ if workflow == "Upload image + metadata":
 
     instrument_metadata = {}
     filename = getattr(file, "name", "")
+    source_sha256 = hashlib.sha256(file.getvalue()).hexdigest()
+    if st.session_state.get("_source_sha256") != source_sha256:
+        for state_key in (
+            "step1_results",
+            "nexus_definition",
+            "nxdl_path",
+            "allowed_paths",
+            "_stash_field_path",
+            "_definition_selector",
+            "nexus_export",
+        ):
+            st.session_state.pop(state_key, None)
+        st.session_state._source_sha256 = source_sha256
+
     if filename.lower().endswith((".tif", ".tiff")):
         try:
             instrument_metadata = extract_metadata_from_tiff(file)
@@ -1092,6 +1107,7 @@ if workflow == "Upload image + metadata":
 
             st.session_state.step1_results = results
             st.session_state.nexus_definition = definition
+            st.session_state._definition_selector = definition
             st.session_state.nxdl_path = str(xml_path) if xml_path else None
             st.session_state.allowed_paths = sorted(list(allowed_paths)) if allowed_paths else []
 
@@ -1101,6 +1117,42 @@ if workflow == "Upload image + metadata":
 
     if "step1_results" in st.session_state:
         res = st.session_state.step1_results
+
+        available_definitions = sorted(
+            {
+                nx_definition
+                for nx_definition in EXPERIMENT_TO_NX.values()
+                if nx_definition != "Other" and find_definition_xml(nx_definition)
+            }
+        )
+        automatic_definition = pick_nexus_definition(
+            res.get("instrument_name", "unknown"),
+            res.get("experiment_type", "Other"),
+        )
+        if automatic_definition not in available_definitions:
+            automatic_definition = "NXem" if "NXem" in available_definitions else available_definitions[0]
+        if st.session_state.get("_definition_selector") not in available_definitions:
+            st.session_state._definition_selector = automatic_definition
+
+        selected_definition = st.selectbox(
+            "NeXus application definition",
+            available_definitions,
+            key="_definition_selector",
+            help=(
+                "The automatic choice is selected initially. Override it when a TIFF header "
+                "does not contain enough information to identify the technique."
+            ),
+        )
+        if selected_definition != st.session_state.get("nexus_definition"):
+            xml_path, allowed_paths = load_definition_schema_xml(selected_definition)
+            st.session_state.nexus_definition = selected_definition
+            st.session_state.nxdl_path = str(xml_path) if xml_path else None
+            st.session_state.allowed_paths = sorted(allowed_paths) if allowed_paths else []
+            st.session_state["_stash_field_path"] = _find_best_stash_field(
+                st.session_state.allowed_paths
+            )
+            st.session_state.pop("nexus_export", None)
+
         st.subheader("🔍 LLM Raw Responses")
         st.text_area("Instrument response (raw)", res.get("raw_instrument", ""), height=140)
         st.text_area("Experiment-type response (raw)", res.get("raw_experiment", ""), height=140)
@@ -1146,11 +1198,16 @@ if workflow == "Upload image + metadata":
         if not aps_list:
             st.info("No allowed paths found for the selected definition — cannot map.")
         else:
-            if st.session_state.get("_nxem_example_index") is None:
-                pairs = load_all_example_pairs_from_dir(EXAMPLE_MAPPINGS_DIR, definition_prefix="NXem")
-                st.session_state._nxem_example_index = build_example_index(pairs)
+            definition = st.session_state.get("nexus_definition", "NXem")
+            example_indexes = st.session_state.setdefault("_example_indexes", {})
+            if definition not in example_indexes:
+                pairs = load_all_example_pairs_from_dir(
+                    EXAMPLE_MAPPINGS_DIR,
+                    definition_prefix=definition,
+                )
+                example_indexes[definition] = build_example_index(pairs)
 
-            index = st.session_state._nxem_example_index
+            index = example_indexes[definition]
 
             mapping_mode = st.radio(
                 "Mapping mode",
@@ -1475,6 +1532,51 @@ if workflow == "Upload image + metadata":
                         f"Saved mappings and stashed metadata for "
                         f"**{instrument_name} | {definition}** → mapping_db.json"
                     )
+
+                    try:
+                        nexus_bytes, export_report = build_nexus_file(
+                            image_array=st.session_state.image_array,
+                            source_filename=filename,
+                            metadata=safe_md,
+                            mapping=accepted,
+                            definition=definition,
+                            instrument=instrument_name,
+                            stashed_metadata=stash_payload,
+                        )
+                        output_stem = Path(filename).stem or "mapped_metadata"
+                        st.session_state.nexus_export = {
+                            "bytes": nexus_bytes,
+                            "filename": f"{output_stem}_{definition}.nxs",
+                            "report": export_report,
+                            "source_sha256": source_sha256,
+                        }
+                    except Exception as e:
+                        st.session_state.pop("nexus_export", None)
+                        st.error(f"Could not create the NeXus file: {e}")
+
+            nexus_export = st.session_state.get("nexus_export")
+            if nexus_export and nexus_export.get("source_sha256") == source_sha256:
+                export_report = nexus_export.get("report", {})
+                st.subheader("💾 Export mapped NeXus file")
+                st.download_button(
+                    "Download NeXus (.nxs)",
+                    data=nexus_export["bytes"],
+                    file_name=nexus_export["filename"],
+                    mime="application/x-hdf5",
+                    key="download_nexus_file",
+                )
+                st.caption(
+                    f"Written mapped fields: {export_report.get('written_count', 0)} | "
+                    f"Unresolved accepted mappings: {export_report.get('unresolved_count', 0)} | "
+                    f"Previously stashed keys: {export_report.get('stashed_input_count', 0)}"
+                )
+                if export_report.get("unresolved_count", 0):
+                    st.warning(
+                        "Some accepted mappings targeted an NX group or collided with another dataset. "
+                        "They were preserved under /entry/unmapped_metadata instead of being overwritten."
+                    )
+                with st.expander("NeXus export report"):
+                    st.json(export_report)
 
 else:
     st.info("This workflow will be implemented in a later step. For now, use ‘Upload image + metadata’.")
