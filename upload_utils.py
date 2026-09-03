@@ -1,6 +1,7 @@
 # upload_utils.py
 
 import requests
+import h5py
 from tifffile import TiffFile
 import tifffile  # <-- needed for tifffile.imread used below
 import numpy as np
@@ -10,6 +11,7 @@ from PIL import Image
 import os
 import json
 import string
+from datetime import datetime, timezone
 
 # =========================
 # Helpers: parse vendor blobs (bytes/text) into key=value dict
@@ -152,6 +154,192 @@ def make_json_safe(obj):
         return obj
     else:
         return str(obj)
+
+
+def _metadata_value_at_path(metadata: dict, dotted_key: str):
+    node = metadata
+    for part in dotted_key.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def _hdf5_value(value):
+    safe = make_json_safe(value)
+    if safe is None or isinstance(safe, (dict, list)):
+        return json.dumps(safe, ensure_ascii=False)
+    return safe
+
+
+def _group_name_from_nx_class(nx_class: str) -> str:
+    name = nx_class[2:] if nx_class.startswith("NX") else nx_class
+    name = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_").lower()
+    return name or "group"
+
+
+def _ensure_nexus_group(parent, name: str, nx_class: str):
+    if name in parent:
+        child = parent[name]
+        if not isinstance(child, h5py.Group):
+            raise ValueError(f"'{child.name}' already exists as a dataset")
+        existing_class = child.attrs.get("NX_class")
+        if existing_class and existing_class != nx_class:
+            raise ValueError(
+                f"'{child.name}' already has NX_class={existing_class!r}, not {nx_class!r}"
+            )
+        child.attrs["NX_class"] = nx_class
+        return child
+    child = parent.create_group(name)
+    child.attrs["NX_class"] = nx_class
+    return child
+
+
+def _write_mapped_value(entry, nxdl_path: str, metadata_key: str, value):
+    """Write one mapped scalar and return its concrete HDF5 path.
+
+    NXDL paths in the GUI use NX class names for groups. Concrete HDF5 group
+    names are derived from those classes while the original classes are stored
+    in each group's NX_class attribute.
+    """
+    parts = [part for part in str(nxdl_path).split("/") if part]
+    if len(parts) < 2 or parts[0] != "NXentry":
+        raise ValueError("mapped path must start with NXentry and end in a field")
+    if parts[-1].startswith("NX"):
+        raise ValueError("mapped path ends at an NX group, not a writable field")
+
+    group = entry
+    for nx_class in parts[1:-1]:
+        if not nx_class.startswith("NX"):
+            raise ValueError(f"intermediate path component '{nx_class}' is not an NX class")
+        group = _ensure_nexus_group(
+            group,
+            _group_name_from_nx_class(nx_class),
+            nx_class,
+        )
+
+    field_name = parts[-1]
+    if field_name in group:
+        raise ValueError(f"target dataset '{group.name}/{field_name}' already exists")
+    dataset = group.create_dataset(field_name, data=_hdf5_value(value))
+    dataset.attrs["source_metadata_key"] = metadata_key
+    dataset.attrs["predicted_nxdl_path"] = nxdl_path
+    return dataset.name
+
+
+def build_nexus_file(
+    image_array,
+    source_filename: str,
+    metadata: dict,
+    mapping: dict,
+    definition: str,
+    instrument: str,
+    stashed_metadata: dict | None = None,
+):
+    """Build an in-memory NeXus/HDF5 file from one GUI mapping result.
+
+    Returns ``(file_bytes, report)``. Invalid group targets and target
+    collisions are never overwritten; their original values are retained in
+    the unmapped-metadata JSON and described in the report.
+    """
+    created_at = datetime.now(timezone.utc).isoformat()
+    accepted_mapping = mapping if isinstance(mapping, dict) else {}
+    supplied_stash = stashed_metadata if isinstance(stashed_metadata, dict) else {}
+    report = {
+        "definition": definition,
+        "instrument": instrument,
+        "source_filename": source_filename,
+        "created_at": created_at,
+        "accepted_mapping_count": len(accepted_mapping),
+        "written_count": 0,
+        "unresolved_count": 0,
+        "stashed_input_count": len(supplied_stash),
+        "written": {},
+        "unresolved": {},
+    }
+    unresolved = {
+        key: make_json_safe(details)
+        for key, details in supplied_stash.items()
+    }
+
+    output = BytesIO()
+    with h5py.File(output, "w") as handle:
+        handle.attrs["file_name"] = source_filename.rsplit(".", 1)[0] + ".nxs"
+        handle.attrs["file_time"] = created_at
+        handle.attrs["creator"] = "FAIR NeXus Metadata Mapper"
+        handle.attrs["HDF5_Version"] = h5py.version.hdf5_version
+
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("definition", data=str(definition or ""))
+
+        source_image = entry.create_group("source_image")
+        source_image.attrs["NX_class"] = "NXdata"
+        source_image.attrs["signal"] = "image"
+        image = np.asarray(image_array)
+        source_image.create_dataset(
+            "image",
+            data=image,
+            compression="gzip" if image.ndim > 0 else None,
+            compression_opts=4 if image.ndim > 0 else None,
+        )
+
+        for metadata_key, nxdl_path in accepted_mapping.items():
+            value = _metadata_value_at_path(metadata, metadata_key)
+            try:
+                concrete_path = _write_mapped_value(
+                    entry,
+                    str(nxdl_path),
+                    str(metadata_key),
+                    value,
+                )
+                report["written"][metadata_key] = {
+                    "predicted_nxdl_path": nxdl_path,
+                    "hdf5_path": concrete_path,
+                }
+                report["written_count"] += 1
+            except Exception as exc:
+                details = {
+                    "value": make_json_safe(value),
+                    "predicted_path": nxdl_path,
+                    "reason": str(exc),
+                }
+                unresolved[metadata_key] = details
+                report["unresolved"][metadata_key] = details
+                report["unresolved_count"] += 1
+
+        if "title" not in entry:
+            entry.create_dataset("title", data=f"Mapped metadata from {source_filename}")
+
+        unmapped = entry.create_group("unmapped_metadata")
+        unmapped.attrs["NX_class"] = "NXnote"
+        unmapped.create_dataset("type", data="application/json")
+        unmapped.create_dataset(
+            "data",
+            data=json.dumps(unresolved, indent=2, ensure_ascii=False),
+        )
+
+        provenance = entry.create_group("mapping_provenance")
+        provenance.attrs["NX_class"] = "NXnote"
+        provenance.create_dataset("type", data="application/json")
+        provenance.create_dataset(
+            "data",
+            data=json.dumps(
+                {
+                    "definition": definition,
+                    "instrument": instrument,
+                    "source_filename": source_filename,
+                    "created_at": created_at,
+                    "mapping": accepted_mapping,
+                    "written": report["written"],
+                    "unresolved": report["unresolved"],
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
+
+    return output.getvalue(), report
 
 def read_image_any_format(file) -> np.ndarray:
     try:
